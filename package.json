@@ -1,0 +1,76 @@
+{
+  "name": "ag-stealth-switcher",
+  "displayName": "Antigravity Stealth Profile Switcher",
+  "description": "Isolated local account switcher for secondary (portable) Antigravity IDE instances without MITM proxy or quota leakage",
+  "version": "1.0.0",
+  "publisher": "stealth-switcher",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "ag-stealth-switcher.showMenu",
+        "title": "AG Switcher: Show Profile Menu"
+      },
+      {
+        "command": "ag-stealth-switcher.openStats",
+        "title": "AG Switcher: Open Token Statistics"
+      },
+      {
+        "command": "ag-stealth-switcher.captureAccount",
+        "title": "AG Switcher: Save Current Account to Pool"
+      },
+      {
+        "command": "ag-stealth-switcher.switchBlank",
+        "title": "AG Switcher: Login New Account (Blank Profile)"
+      },
+      {
+        "command": "ag-stealth-switcher.toggleMode",
+        "title": "AG Switcher: Toggle Switch Mode (in-place / isolated-dir)"
+      },
+      {
+        "command": "ag-stealth-switcher.refreshQuota",
+        "title": "AG Switcher: Refresh Quota Now"
+      }
+    ],
+    "configuration": {
+      "title": "Antigravity Stealth Switcher",
+      "properties": {
+        "agStealthSwitcher.mode": {
+          "type": "string",
+          "enum": [
+            "in-place",
+            "isolated-dir"
+          ],
+          "default": "in-place",
+          "description": "Switching strategy: in-place (hot swap in shared sandbox data) or isolated-dir (separate user-data directory per profile)"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./ && node scripts/copy-wasm.js",
+    "watch": "tsc -watch -p ./",
+    "build-worker": "tsc src/cli/switchWorker.ts --outDir dist/cli --module commonjs --target es2022 --moduleResolution node --esModuleInterop",
+    "package": "npx @vscode/vsce package --no-dependencies"
+  },
+  "dependencies": {
+    "sql.js": "^1.10.3"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "@types/sql.js": "^1.4.9",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^2.24.0",
+    "typescript": "^5.3.3"
+  }
+}
