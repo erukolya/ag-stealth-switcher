@@ -39,8 +39,10 @@ export interface StoredProfile {
   proxyUrl?: string; // Argon fix #2: individual proxy per profile
 }
 
+export type SwitcherMode = 'in-place' | 'isolated-dir';
+
 export interface SwitcherConfig {
-  mode: 'in-place' | 'isolated-dir';
+  mode: SwitcherMode;
   activeProfile: string | null;
   globalProxyUrl?: string;
   lastUpdated?: string;
@@ -121,9 +123,8 @@ export function readCliToken(cliTokenPath: string, sandboxRoot: string): any | n
 }
 
 /**
- * Writes oauth_token.json conforming to Antigravity >= 2.6.0 schema:
- * - "expires_in": 3599
- * - "id_token_email": "<user@gmail.com>"
+ * Writes oauth_token.json conforming to Antigravity schema:
+ * Preserves authentic token lifetime without synthesizing artificial expiry.
  */
 export function writeCliToken(cliTokenPath: string, tokenData: any, email: string, sandboxRoot: string): void {
   assertInsideSandbox(cliTokenPath, sandboxRoot);
@@ -131,7 +132,6 @@ export function writeCliToken(cliTokenPath: string, tokenData: any, email: strin
 
   const updatedToken = {
     ...(tokenData || {}),
-    expires_in: 3599,
     id_token_email: email,
   };
 
@@ -182,7 +182,9 @@ export function writeGeminiFileCredentials(
   const accessToken = rawToken.access_token || (typeof rawToken === 'string' ? rawToken : '');
   const refreshToken = rawToken.refresh_token || '';
   const idToken = rawToken.id_token || undefined;
-  const expiryDate = rawToken.expiry_date || Date.now() + 3600 * 1000;
+  // Preserve authentic expiry timestamp if present; avoid artificial Date.now() + 1h synthesis.
+  // When expiry_date is 0 or absent, Antigravity language_server natively triggers OAuth refresh.
+  const expiryDate = rawToken.expiry_date ?? (rawToken.expires_at ? rawToken.expires_at * 1000 : 0);
 
   // 1. oauth_creds.json
   const creds = {
@@ -428,7 +430,9 @@ export function buildQuotaSnapshot(status: UserStatusResult | null): ProfileQuot
   };
 }
 
-export interface ActiveSessionPaths {
+export interface ActiveSessionContext {
+  mode: SwitcherMode;
+  account?: string;
   userDataDir: string;
   userHome: string;
   stateVscdb: string;
@@ -437,17 +441,20 @@ export interface ActiveSessionPaths {
   geminiHome: string;
 }
 
+export type ActiveSessionPaths = ActiveSessionContext;
+
 /**
- * Resolves the real paths of the currently executing IDE session.
- * In isolated-dir mode, retrieves paths from --user-data-dir arguments or activeProfile isolated folder.
- * In in-place mode, defaults to standard SandboxHome and data/ paths.
+ * Resolves the real unified context of the currently executing IDE session.
+ * In isolated-dir mode, retrieves paths and account identity from active folder / environment.
+ * Ensures that credentials and database states are strictly isolated without leaking between accounts.
  */
-export function getActiveSessionPaths(sandboxRoot: string, emailHint?: string): ActiveSessionPaths {
+export function getActiveSessionContext(sandboxRoot: string, emailHint?: string): ActiveSessionContext {
   const defaultPaths = getSandboxPaths(sandboxRoot);
   const config = loadConfig(sandboxRoot);
 
   let activeUserData = defaultPaths.userDataDir;
   let activeHome = defaultPaths.sandboxHome;
+  let detectedAccount = emailHint;
 
   // 1. Scan command-line arguments for explicit --user-data-dir
   if (Array.isArray(process.argv)) {
@@ -469,21 +476,43 @@ export function getActiveSessionPaths(sandboxRoot: string, emailHint?: string): 
     path.resolve(envHome).toLowerCase() !== path.resolve(defaultPaths.sandboxHome).toLowerCase()
   ) {
     activeHome = path.resolve(envHome);
-  } else if (config.mode === 'isolated-dir') {
-    // If running in isolated-dir mode and activeProfile or emailHint is specified
-    const targetEmail = emailHint || config.activeProfile;
-    if (targetEmail) {
-      const isolated = prepareIsolatedDir(sandboxRoot, targetEmail);
-      if (fs.existsSync(isolated.userData)) {
-        activeUserData = isolated.userData;
-      }
-      if (fs.existsSync(isolated.userHome)) {
-        activeHome = isolated.userHome;
+  }
+
+  // 3. Detect account name from isolated path if running inside isolated_envs
+  if (!detectedAccount) {
+    const isolatedMarker = `${path.sep}isolated_envs${path.sep}`;
+    const searchTarget = activeUserData.includes('isolated_envs') ? activeUserData : activeHome;
+    const idx = searchTarget.indexOf(isolatedMarker);
+    if (idx !== -1) {
+      const remainder = searchTarget.slice(idx + isolatedMarker.length);
+      const parts = remainder.split(path.sep);
+      if (parts.length > 0 && parts[0]) {
+        detectedAccount = parts[0];
       }
     }
   }
 
+  // 4. Resolve isolated-dir paths if running in isolated mode
+  const targetEmail = detectedAccount || emailHint || config.activeProfile;
+  const isIsolatedMode =
+    config.mode === 'isolated-dir' ||
+    activeUserData.includes('isolated_envs') ||
+    activeHome.includes('isolated_envs');
+
+  if (isIsolatedMode && targetEmail) {
+    const isolated = prepareIsolatedDir(sandboxRoot, targetEmail);
+    if (fs.existsSync(isolated.userData) || activeUserData.includes('isolated_envs')) {
+      activeUserData = isolated.userData;
+    }
+    if (fs.existsSync(isolated.userHome) || activeHome.includes('isolated_envs')) {
+      activeHome = isolated.userHome;
+    }
+    detectedAccount = targetEmail;
+  }
+
   return {
+    mode: isIsolatedMode ? 'isolated-dir' : 'in-place',
+    account: detectedAccount,
     userDataDir: activeUserData,
     userHome: activeHome,
     stateVscdb: path.join(activeUserData, 'User', 'globalStorage', 'state.vscdb'),
@@ -492,6 +521,8 @@ export function getActiveSessionPaths(sandboxRoot: string, emailHint?: string): 
     geminiHome: activeHome,
   };
 }
+
+export const getActiveSessionPaths = getActiveSessionContext;
 
 /**
  * Captures the currently active session in the sandbox and stores it as a profile snapshot.
@@ -502,15 +533,15 @@ export async function captureCurrentProfile(
   sandboxRoot: string,
   emailOverride?: string
 ): Promise<StoredProfile> {
-  const sessionPaths = getActiveSessionPaths(sandboxRoot, emailOverride);
+  const session = getActiveSessionContext(sandboxRoot, emailOverride);
 
-  // 1. Read token strictly from isolated sandbox files: CLI token or Gemini file credentials
-  let cliToken = readCliToken(sessionPaths.cliTokenFile, sandboxRoot);
+  // 1. Read token strictly from active session paths: CLI token or Gemini file credentials
+  let cliToken = readCliToken(session.cliTokenFile, sandboxRoot);
   if (!cliToken) {
-    cliToken = readGeminiFileCredentials(sessionPaths.geminiHome, sandboxRoot);
+    cliToken = readGeminiFileCredentials(session.geminiHome, sandboxRoot);
   }
-  // Fallback to default paths if isolated directory was fresh/empty
-  if (!cliToken) {
+  // Fallback to default paths ONLY if in clean-env mode (never mix credentials in isolated-dir mode)
+  if (!cliToken && session.mode !== 'isolated-dir') {
     const defaultPaths = getSandboxPaths(sandboxRoot);
     cliToken = readCliToken(defaultPaths.cliTokenFile, sandboxRoot);
     if (!cliToken) {
@@ -518,7 +549,7 @@ export async function captureCurrentProfile(
     }
   }
 
-  // 2. Resolve email automatically
+  // 2. Resolve email automatically from token, RPC, or session context
   let email = emailOverride;
   if (!email && cliToken && cliToken.id_token_email) {
     email = cliToken.id_token_email;
@@ -531,22 +562,26 @@ export async function captureCurrentProfile(
     }
   }
 
+  if (!email && session.account) {
+    email = session.account;
+  }
+
   if (!email) {
     const config = loadConfig(sandboxRoot);
     email = config.activeProfile || `account_${Date.now()}@sandbox`;
   }
 
   // 3. Extract database auth rows from active session's state.vscdb
-  let dbItems = await extractAuthItemsFromDb(sessionPaths.stateVscdb, sandboxRoot);
-  if (dbItems.length === 0) {
+  let dbItems = await extractAuthItemsFromDb(session.stateVscdb, sandboxRoot);
+  if (dbItems.length === 0 && session.mode !== 'isolated-dir') {
     const defaultPaths = getSandboxPaths(sandboxRoot);
-    if (sessionPaths.stateVscdb !== defaultPaths.stateVscdb && fs.existsSync(defaultPaths.stateVscdb)) {
+    if (session.stateVscdb !== defaultPaths.stateVscdb && fs.existsSync(defaultPaths.stateVscdb)) {
       dbItems = await extractAuthItemsFromDb(defaultPaths.stateVscdb, sandboxRoot);
     }
   }
 
   // 4. Read telemetry IDs from active session's storage.json
-  const telemetry = readOrGenerateTelemetry(sessionPaths.storageJson, sandboxRoot);
+  const telemetry = readOrGenerateTelemetry(session.storageJson, sandboxRoot);
 
   // 5. Build quota snapshot on-demand
   let userStatus: UserStatusResult | null = null;
@@ -560,8 +595,8 @@ export async function captureCurrentProfile(
   const now = new Date().toISOString();
   const quotas = userStatus ? buildQuotaSnapshot(userStatus) : existing?.quotas;
 
+  // Preserve authentic token fields without synthetic expires_in overwrite
   if (cliToken) {
-    cliToken.expires_in = 3599;
     cliToken.id_token_email = email;
   }
 
@@ -579,12 +614,15 @@ export async function captureCurrentProfile(
 
   saveProfile(sandboxRoot, profile);
 
-  // Sync file credentials into active session home AND default sandboxHome/.gemini
+  // Sync file credentials into active session home
   if (profile.cliToken) {
-    writeGeminiFileCredentials(sessionPaths.geminiHome, email, profile.cliToken, sandboxRoot);
-    const defaultPaths = getSandboxPaths(sandboxRoot);
-    if (sessionPaths.geminiHome !== defaultPaths.sandboxHome) {
-      writeGeminiFileCredentials(defaultPaths.sandboxHome, email, profile.cliToken, sandboxRoot);
+    writeGeminiFileCredentials(session.geminiHome, email, profile.cliToken, sandboxRoot);
+    // Only mirror to default sandboxHome in clean-env mode
+    if (session.mode !== 'isolated-dir') {
+      const defaultPaths = getSandboxPaths(sandboxRoot);
+      if (session.geminiHome !== defaultPaths.sandboxHome) {
+        writeGeminiFileCredentials(defaultPaths.sandboxHome, email, profile.cliToken, sandboxRoot);
+      }
     }
   }
 

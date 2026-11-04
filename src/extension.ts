@@ -2,7 +2,6 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import { spawn } from 'child_process';
 import { getSandboxRoot, isRunningInsideSandbox } from './core/sandboxEnv';
-import { getSandboxPaths } from './core/paths';
 import { getLocalUserStatus } from './core/lsRpcClient';
 import {
   listProfiles,
@@ -15,6 +14,8 @@ import {
   deleteProfile,
   calculateEstimatedQuota,
   readCliToken,
+  readGeminiFileCredentials,
+  getActiveSessionContext,
 } from './core/profileStore';
 import { StatsPanel } from './ui/statsPanel';
 
@@ -284,10 +285,13 @@ async function showProfileQuickPick(context: vscode.ExtensionContext, sandboxRoo
  */
 async function handleCaptureCurrentAccount(sandboxRoot: string): Promise<void> {
   try {
-    const paths = getSandboxPaths(sandboxRoot);
-    const cliToken = readCliToken(paths.cliTokenFile, sandboxRoot);
+    const session = getActiveSessionContext(sandboxRoot);
+    let cliToken = readCliToken(session.cliTokenFile, sandboxRoot);
+    if (!cliToken) {
+      cliToken = readGeminiFileCredentials(session.geminiHome, sandboxRoot);
+    }
 
-    let detectedEmail: string | undefined = cliToken?.id_token_email;
+    let detectedEmail: string | undefined = session.account || cliToken?.id_token_email;
 
     if (!detectedEmail) {
       try {

@@ -98,7 +98,7 @@ export async function openTokenStatsDb(
   db.run(`
     CREATE TABLE IF NOT EXISTS token_usage (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        step_key TEXT UNIQUE,
+        step_key TEXT,
         timestamp INTEGER NOT NULL,
         account_email TEXT NOT NULL,
         model TEXT NOT NULL,
@@ -112,19 +112,68 @@ export async function openTokenStatsDb(
   `);
 
   // 2. Automated schema migration: add step_key column if upgrading an existing legacy database
+  let ranMigration = false;
   try {
     const tableInfo = db.exec('PRAGMA table_info(token_usage);');
     if (tableInfo.length > 0 && Array.isArray(tableInfo[0].values)) {
       const hasStepKey = tableInfo[0].values.some((col: any) => col[1] === 'step_key');
       if (!hasStepKey) {
         db.run('ALTER TABLE token_usage ADD COLUMN step_key TEXT;');
+        ranMigration = true;
       }
     }
   } catch {
     // Migration fallback failed non-fatally
   }
 
-  // 3. Create indices and auxiliary tables
+  // 3. Purge synthetic records and backfill deterministic step_key for legacy records
+  try {
+    const nullCheck = db.exec('SELECT COUNT(*) FROM token_usage WHERE step_key IS NULL;');
+    const nullCount =
+      nullCheck.length > 0 && nullCheck[0].values[0] ? Number(nullCheck[0].values[0][0]) : 0;
+
+    if (nullCount > 0 || ranMigration) {
+      ranMigration = true;
+      // 3a. Remove synthetic multiplier rows from earlier versions (e.g. 430/250/180 estimates)
+      db.run(`
+        DELETE FROM token_usage
+        WHERE step_key IS NULL
+          AND (
+            (input_tokens % 250 = 0 AND output_tokens % 180 = 0 AND total_tokens = (input_tokens + output_tokens) AND total_tokens > 0)
+            OR (input_tokens = 0 AND output_tokens = 0 AND total_tokens > 0)
+          );
+      `);
+
+      // 3b. Backfill remaining authentic legacy rows with unique deterministic step_keys
+      db.run(`
+        UPDATE token_usage
+        SET step_key = 'migrated_' || id || '_' || timestamp || '_' || model
+        WHERE step_key IS NULL;
+      `);
+
+      // 3c. Rebuild token_stats_hourly aggregates from clean token_usage to eliminate double-counted hourly totals
+      db.run('DELETE FROM token_stats_hourly;');
+      db.run(`
+        INSERT OR REPLACE INTO token_stats_hourly (
+          hour_bucket, account_email, total_input_tokens, total_output_tokens, total_cached_tokens, total_tokens, request_count
+        )
+        SELECT
+          strftime('%Y-%m-%d %H:00', datetime(timestamp, 'unixepoch', 'localtime')) AS hour_bucket,
+          account_email,
+          SUM(input_tokens),
+          SUM(output_tokens),
+          SUM(cached_tokens),
+          SUM(total_tokens),
+          COUNT(*)
+        FROM token_usage
+        GROUP BY hour_bucket, account_email;
+      `);
+    }
+  } catch {
+    // Legacy sanitation failed non-fatally
+  }
+
+  // 4. Create indices and auxiliary tables
   db.run(`
     CREATE UNIQUE INDEX IF NOT EXISTS idx_token_step_key ON token_usage (step_key);
     CREATE INDEX IF NOT EXISTS idx_token_timestamp ON token_usage (timestamp DESC);
@@ -159,6 +208,13 @@ export async function openTokenStatsDb(
     fs.writeFileSync(tmpPath, buffer);
     fs.renameSync(tmpPath, dbPath);
   };
+
+  // If schema was migrated or legacy rows sanitized, persist to disk immediately
+  if (ranMigration) {
+    try {
+      save();
+    } catch {}
+  }
 
   const close = () => {
     db.close();

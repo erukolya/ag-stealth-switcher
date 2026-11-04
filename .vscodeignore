@@ -9,3 +9,4 @@ tsconfig.json
 node_modules/sql.js/dist/*.zip
 node_modules/sql.js/dist/*-debug.*
 node_modules/sql.js/.devcontainer/**
+test_*.js

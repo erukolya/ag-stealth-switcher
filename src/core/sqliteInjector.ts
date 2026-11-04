@@ -90,6 +90,33 @@ export function sanitizeSqliteBuffer(buffer: Buffer): Buffer {
 }
 
 /**
+ * Strict authentication and OAuth keys in ItemTable.
+ * Strictly avoids deleting third-party extension secrets or general IDE UI/cache state.
+ */
+export const AUTH_ITEMS_WHERE_CLAUSE = `
+  (
+    key IN (
+      'antigravityUnifiedStateSync.oauthToken',
+      'antigravityUnifiedStateSync.userStatus',
+      'jetskiStateSync.oauthToken',
+      'jetskiStateSync.userStatus',
+      'codeium.user',
+      'codeium.apiKey',
+      'storage.serviceMachineId'
+    )
+    OR key LIKE 'antigravityUnifiedStateSync.%'
+    OR key LIKE 'jetskiStateSync.%'
+    OR key LIKE 'codeium.%'
+    OR key LIKE 'google.login%'
+    OR key LIKE 'uss-oauth%'
+    OR key LIKE 'secret://%antigravity%'
+    OR key LIKE 'secret://%codeium%'
+    OR key LIKE 'secret://%google%'
+    OR key LIKE 'secret://%jetski%'
+  )
+`;
+
+/**
  * Opens state.vscdb via sql.js (WebAssembly).
  * Safely handles WAL mode databases and atomic saves.
  */
@@ -111,11 +138,21 @@ export async function openStateDb(
           const { DatabaseSync } = require('node:sqlite');
           if (typeof DatabaseSync === 'function') {
             const sdb = new DatabaseSync(dbPath);
-            sdb.exec('PRAGMA wal_checkpoint(TRUNCATE);');
-            sdb.close();
+            try {
+              sdb.exec('PRAGMA wal_checkpoint(TRUNCATE);');
+            } finally {
+              sdb.close();
+            }
           }
         }
-      } catch {}
+      } catch (err: any) {
+        // If checkpoint failed on a non-empty WAL file, throw error rather than reading stale main db
+        if (fs.existsSync(walFile) && fs.statSync(walFile).size > 0) {
+          throw new Error(
+            `Cannot open SQLite database: WAL checkpoint failed (${err.message}). Database may be locked by a running process.`
+          );
+        }
+      }
     }
 
     const rawBuffer = fs.readFileSync(dbPath);
@@ -158,8 +195,11 @@ export async function openStateDb(
             const { DatabaseSync } = require('node:sqlite');
             if (typeof DatabaseSync === 'function') {
               const sdb = new DatabaseSync(dbPath);
-              sdb.exec('PRAGMA wal_checkpoint(TRUNCATE);');
-              sdb.close();
+              try {
+                sdb.exec('PRAGMA wal_checkpoint(TRUNCATE);');
+              } finally {
+                sdb.close();
+              }
             }
           } catch {}
           if (fs.existsSync(walFile) && fs.statSync(walFile).size === 0) {
@@ -184,25 +224,46 @@ export async function openStateDb(
 
 /**
  * Extracts all authentication, session and OAuth rows from ItemTable.
+ * Leverages native node:sqlite readOnly MVCC connection first to read active WAL transactions live.
  */
 export async function extractAuthItemsFromDb(dbPath: string, sandboxRoot: string): Promise<DbItem[]> {
   if (!fs.existsSync(dbPath)) {
     return [];
   }
+  assertInsideSandbox(dbPath, sandboxRoot, 'read');
 
+  // 1. Primary extraction via native node:sqlite with readOnly: true (supports MVCC live WAL reads)
+  try {
+    const { DatabaseSync } = require('node:sqlite');
+    if (typeof DatabaseSync === 'function') {
+      const sdb = new DatabaseSync(dbPath, { readOnly: true });
+      try {
+        const query = `
+          SELECT key, value FROM ItemTable
+          WHERE ${AUTH_ITEMS_WHERE_CLAUSE};
+        `;
+        const stmt = sdb.prepare(query);
+        const rows = stmt.all() as any[];
+        return rows.map((row: any) => ({
+          key: String(row.key),
+          value: typeof row.value === 'string' ? row.value : Buffer.from(row.value).toString('utf-8'),
+        }));
+      } finally {
+        sdb.close();
+      }
+    }
+  } catch {
+    // If native node:sqlite unavailable or fails, fall through to sql.js fallback
+  }
+
+  // 2. Fallback via sql.js (WebAssembly)
   const { db, close } = await openStateDb(dbPath, sandboxRoot);
   const results: DbItem[] = [];
 
   try {
     const query = `
       SELECT key, value FROM ItemTable
-      WHERE key LIKE '%antigravity%'
-         OR key LIKE '%uss-oauth%'
-         OR key LIKE '%google%'
-         OR key LIKE '%jetski%'
-         OR key LIKE '%codeium%'
-         OR key LIKE '%secret://%'
-         OR key = 'storage.serviceMachineId';
+      WHERE ${AUTH_ITEMS_WHERE_CLAUSE};
     `;
     const stmt = db.prepare(query);
     while (stmt.step()) {
@@ -233,16 +294,10 @@ export async function injectAuthItemsIntoDb(
   const { db, save, close } = await openStateDb(dbPath, sandboxRoot);
 
   try {
-    // 1. Clean existing auth items
+    // 1. Clean existing auth items strictly matching authentication keys
     const deleteQuery = `
       DELETE FROM ItemTable
-      WHERE key LIKE '%antigravity%'
-         OR key LIKE '%uss-oauth%'
-         OR key LIKE '%google%'
-         OR key LIKE '%jetski%'
-         OR key LIKE '%codeium%'
-         OR key LIKE '%secret://%'
-         OR key = 'storage.serviceMachineId';
+      WHERE ${AUTH_ITEMS_WHERE_CLAUSE};
     `;
     db.run(deleteQuery);
 
@@ -276,13 +331,7 @@ export async function clearAuthItemsInDb(dbPath: string, sandboxRoot: string): P
   try {
     const deleteQuery = `
       DELETE FROM ItemTable
-      WHERE key LIKE '%antigravity%'
-         OR key LIKE '%uss-oauth%'
-         OR key LIKE '%google%'
-         OR key LIKE '%jetski%'
-         OR key LIKE '%codeium%'
-         OR key LIKE '%secret://%'
-         OR key = 'storage.serviceMachineId';
+      WHERE ${AUTH_ITEMS_WHERE_CLAUSE};
     `;
     db.run(deleteQuery);
     save();

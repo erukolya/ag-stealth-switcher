@@ -39,7 +39,6 @@ const vscode = __importStar(require("vscode"));
 const path = __importStar(require("path"));
 const child_process_1 = require("child_process");
 const sandboxEnv_1 = require("./core/sandboxEnv");
-const paths_1 = require("./core/paths");
 const lsRpcClient_1 = require("./core/lsRpcClient");
 const profileStore_1 = require("./core/profileStore");
 const statsPanel_1 = require("./ui/statsPanel");
@@ -251,9 +250,12 @@ async function showProfileQuickPick(context, sandboxRoot) {
  */
 async function handleCaptureCurrentAccount(sandboxRoot) {
     try {
-        const paths = (0, paths_1.getSandboxPaths)(sandboxRoot);
-        const cliToken = (0, profileStore_1.readCliToken)(paths.cliTokenFile, sandboxRoot);
-        let detectedEmail = cliToken?.id_token_email;
+        const session = (0, profileStore_1.getActiveSessionContext)(sandboxRoot);
+        let cliToken = (0, profileStore_1.readCliToken)(session.cliTokenFile, sandboxRoot);
+        if (!cliToken) {
+            cliToken = (0, profileStore_1.readGeminiFileCredentials)(session.geminiHome, sandboxRoot);
+        }
+        let detectedEmail = session.account || cliToken?.id_token_email;
         if (!detectedEmail) {
             try {
                 const userStatus = await (0, lsRpcClient_1.getLocalUserStatus)(sandboxRoot);

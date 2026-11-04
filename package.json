@@ -4,6 +4,11 @@
   "description": "Isolated local account switcher for secondary (portable) Antigravity IDE instances without MITM proxy or quota leakage",
   "version": "1.0.0",
   "publisher": "stealth-switcher",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/erukolya/ag-stealth-switcher.git"
+  },
   "engines": {
     "vscode": "^1.85.0"
   },
