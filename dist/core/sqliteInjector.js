@@ -128,6 +128,22 @@ async function openStateDb(dbPath, sandboxRoot) {
     const SQL = await getSqlInstance();
     let db;
     if (fs.existsSync(dbPath)) {
+        // Safety check: if an unmerged non-empty WAL file exists, consolidate transactions before loading memory buffer
+        const walFile = `${dbPath}-wal`;
+        if (fs.existsSync(walFile)) {
+            try {
+                const stat = fs.statSync(walFile);
+                if (stat.size > 0) {
+                    const { DatabaseSync } = require('node:sqlite');
+                    if (typeof DatabaseSync === 'function') {
+                        const sdb = new DatabaseSync(dbPath);
+                        sdb.exec('PRAGMA wal_checkpoint(TRUNCATE);');
+                        sdb.close();
+                    }
+                }
+            }
+            catch { }
+        }
         const rawBuffer = fs.readFileSync(dbPath);
         const patchedBuffer = sanitizeSqliteBuffer(rawBuffer);
         db = new SQL.Database(patchedBuffer);
@@ -155,10 +171,29 @@ async function openStateDb(dbPath, sandboxRoot) {
         const tmpPath = `${dbPath}.tmp.${Date.now()}`;
         fs.writeFileSync(tmpPath, buffer);
         fs.renameSync(tmpPath, dbPath);
-        // Clean up any stale -wal or -shm files so SQLite starts cleanly in DELETE mode
+        // Clean up residual -wal file ONLY if truncated/clean to strictly avoid destroying transactions
         try {
-            if (fs.existsSync(`${dbPath}-wal`)) {
-                fs.unlinkSync(`${dbPath}-wal`);
+            const walFile = `${dbPath}-wal`;
+            if (fs.existsSync(walFile)) {
+                const stat = fs.statSync(walFile);
+                if (stat.size === 0) {
+                    fs.unlinkSync(walFile);
+                }
+                else {
+                    // Attempt checkpoint before removing
+                    try {
+                        const { DatabaseSync } = require('node:sqlite');
+                        if (typeof DatabaseSync === 'function') {
+                            const sdb = new DatabaseSync(dbPath);
+                            sdb.exec('PRAGMA wal_checkpoint(TRUNCATE);');
+                            sdb.close();
+                        }
+                    }
+                    catch { }
+                    if (fs.existsSync(walFile) && fs.statSync(walFile).size === 0) {
+                        fs.unlinkSync(walFile);
+                    }
+                }
             }
             if (fs.existsSync(`${dbPath}-shm`)) {
                 fs.unlinkSync(`${dbPath}-shm`);

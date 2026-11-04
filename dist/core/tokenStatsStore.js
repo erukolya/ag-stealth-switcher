@@ -81,7 +81,7 @@ async function openTokenStatsDb(sandboxRoot) {
         fs.mkdirSync(path.dirname(dbPath), { recursive: true });
         db = new SQL.Database();
     }
-    // Ensure schema compatibility with Antigravity-Manager v5.0.2-beta.7+
+    // 1. Table schema definition (Antigravity-Manager v5.0.2-beta.7+ compatible)
     db.run(`
     CREATE TABLE IF NOT EXISTS token_usage (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -96,7 +96,22 @@ async function openTokenStatsDb(sandboxRoot) {
         requested_model TEXT,
         ttft_ms INTEGER
     );
-
+  `);
+    // 2. Automated schema migration: add step_key column if upgrading an existing legacy database
+    try {
+        const tableInfo = db.exec('PRAGMA table_info(token_usage);');
+        if (tableInfo.length > 0 && Array.isArray(tableInfo[0].values)) {
+            const hasStepKey = tableInfo[0].values.some((col) => col[1] === 'step_key');
+            if (!hasStepKey) {
+                db.run('ALTER TABLE token_usage ADD COLUMN step_key TEXT;');
+            }
+        }
+    }
+    catch {
+        // Migration fallback failed non-fatally
+    }
+    // 3. Create indices and auxiliary tables
+    db.run(`
     CREATE UNIQUE INDEX IF NOT EXISTS idx_token_step_key ON token_usage (step_key);
     CREATE INDEX IF NOT EXISTS idx_token_timestamp ON token_usage (timestamp DESC);
     CREATE INDEX IF NOT EXISTS idx_token_account ON token_usage (account_email);

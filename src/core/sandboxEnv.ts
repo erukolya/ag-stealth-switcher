@@ -204,6 +204,10 @@ export function getIsolatedEnv(
     XDG_DATA_HOME: path.join(homePath, '.local', 'share'),
   };
 
+  // Ensure spawned IDE processes never inherit Node CLI mode
+  delete env.ELECTRON_RUN_AS_NODE;
+  delete env['ELECTRON_RUN_AS_NODE'];
+
   if (proxyUrl && proxyUrl.trim().length > 0) {
     const cleanProxy = proxyUrl.trim();
     env['HTTP_PROXY'] = cleanProxy;

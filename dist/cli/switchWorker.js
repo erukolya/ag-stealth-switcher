@@ -87,12 +87,13 @@ function logWorker(sandboxRoot, message) {
  * Safely checkpoints SQLite WAL file into the main database before touching state.vscdb.
  * Adheres strictly to sqlite.org guidelines: NEVER delete a non-empty -wal without checkpointing,
  * as doing so destroys uncommitted and committed transactions.
+ * Returns true if WAL is clean/checkpointed, false if WAL contains unmerged data and could not be checkpointed.
  */
 function safeCheckpointAndConsolidateWal(dbPath, sandboxRoot) {
     const walPath = `${dbPath}-wal`;
     const shmPath = `${dbPath}-shm`;
     if (!fs.existsSync(walPath)) {
-        return;
+        return true;
     }
     try {
         const stat = fs.statSync(walPath);
@@ -106,7 +107,7 @@ function safeCheckpointAndConsolidateWal(dbPath, sandboxRoot) {
                 fs.unlinkSync(shmPath);
             }
             catch { }
-            return;
+            return true;
         }
         logWorker(sandboxRoot, `Pending WAL detected (${stat.size} bytes). Executing PRAGMA wal_checkpoint(TRUNCATE)...`);
         // Strategy 1: Native Node.js DatabaseSync (built-in in Node 22+)
@@ -140,14 +141,18 @@ function safeCheckpointAndConsolidateWal(dbPath, sandboxRoot) {
                     fs.unlinkSync(shmPath);
                 }
                 catch { }
+                return true;
             }
             else {
-                logWorker(sandboxRoot, `Warning: WAL retained ${postStat.size} bytes. Preserving WAL file to prevent SQLite data loss.`);
+                logWorker(sandboxRoot, `CRITICAL: WAL retained ${postStat.size} uncheckpointed bytes. Refusing to delete or overwrite database.`);
+                return false;
             }
         }
+        return true;
     }
     catch (err) {
         logWorker(sandboxRoot, `Warning during WAL checkpoint: ${err.message || err}`);
+        return false;
     }
 }
 async function main() {
@@ -159,15 +164,22 @@ async function main() {
     if (idePid && idePid > 0) {
         logWorker(sandboxRoot, `Waiting for IDE PID ${idePid} to gracefully flush and exit...`);
         const graceStart = Date.now();
-        while (Date.now() - graceStart < 4000) {
+        let exited = false;
+        while (Date.now() - graceStart < 6000) {
             try {
                 process.kill(idePid, 0);
-                await (0, processManager_1.sleep)(200);
+                await (0, processManager_1.sleep)(250);
             }
             catch {
                 logWorker(sandboxRoot, `IDE PID ${idePid} exited gracefully.`);
+                exited = true;
                 break;
             }
+        }
+        // If IDE process is still running after timeout, user cancelled the exit (e.g. unsaved changes dialog)
+        if (!exited) {
+            logWorker(sandboxRoot, `Switch aborted: IDE PID ${idePid} did not exit within timeout (user cancelled quit dialog). Aborting switch.`);
+            process.exit(0);
         }
     }
     // 2. Ensure all lingering sandbox processes are terminated and DB lock released
@@ -181,7 +193,11 @@ async function main() {
     let launchHomeDir = paths.sandboxHome;
     if (mode === 'in-place') {
         logWorker(sandboxRoot, 'Executing in-place profile swap...');
-        safeCheckpointAndConsolidateWal(paths.stateVscdb, sandboxRoot);
+        const checkpointOk = safeCheckpointAndConsolidateWal(paths.stateVscdb, sandboxRoot);
+        if (!checkpointOk) {
+            logWorker(sandboxRoot, 'ABORTING switch: Failed to safely checkpoint WAL on state.vscdb. Aborting to protect database integrity.');
+            process.exit(1);
+        }
         if (isBlank) {
             logWorker(sandboxRoot, 'Clearing credentials for blank login session...');
             await (0, sqliteInjector_1.clearAuthItemsInDb)(paths.stateVscdb, sandboxRoot);
@@ -230,7 +246,11 @@ async function main() {
         launchHomeDir = userHome;
         const isolatedStorageJson = path.join(userData, 'User', 'globalStorage', 'storage.json');
         const isolatedVscdb = path.join(userData, 'User', 'globalStorage', 'state.vscdb');
-        safeCheckpointAndConsolidateWal(isolatedVscdb, sandboxRoot);
+        const checkpointOk = safeCheckpointAndConsolidateWal(isolatedVscdb, sandboxRoot);
+        if (!checkpointOk) {
+            logWorker(sandboxRoot, 'ABORTING switch: Failed to safely checkpoint WAL on isolated state.vscdb. Aborting to protect database integrity.');
+            process.exit(1);
+        }
         if (isBlank) {
             logWorker(sandboxRoot, 'Setting up blank isolated directory...');
             await (0, sqliteInjector_1.clearAuthItemsInDb)(isolatedVscdb, sandboxRoot);
@@ -275,6 +295,9 @@ async function main() {
         logWorker(sandboxRoot, `Setting isolated outbound proxy: ${effectiveProxyUrl} with NO_PROXY`);
     }
     const spawnEnv = (0, sandboxEnv_1.getIsolatedEnv)(sandboxRoot, launchHomeDir, effectiveProxyUrl);
+    // Crucial Electron fix: Strip ELECTRON_RUN_AS_NODE so the launched IDE starts as a full GUI application
+    delete spawnEnv.ELECTRON_RUN_AS_NODE;
+    delete spawnEnv['ELECTRON_RUN_AS_NODE'];
     const spawnArgs = [
         '--user-data-dir', launchUserDataDir,
         '--extensions-dir', paths.extensionsDir,
