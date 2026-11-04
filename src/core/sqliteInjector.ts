@@ -1,9 +1,41 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import initSqlJs, { Database, SqlJsStatic } from 'sql.js';
+import type { Database, SqlJsStatic } from 'sql.js';
 import { assertInsideSandbox } from './sandboxEnv';
 
 let sqlJsPromise: Promise<SqlJsStatic> | null = null;
+
+/**
+ * Resolves the sql.js initialization factory function.
+ * Supports standard module resolution and local bundled sql-wasm.js fallback.
+ */
+function resolveSqlJsFactory(): (config?: any) => Promise<SqlJsStatic> {
+  // 1. Try standard require('sql.js')
+  try {
+    const mod = require('sql.js');
+    return typeof mod === 'function' ? mod : mod.default || mod;
+  } catch {}
+
+  // 2. Try locally bundled sql-wasm.js in same directory
+  const localJs = path.join(__dirname, 'sql-wasm.js');
+  if (fs.existsSync(localJs)) {
+    try {
+      const mod = require(localJs);
+      return typeof mod === 'function' ? mod : mod.default || mod;
+    } catch {}
+  }
+
+  // 3. Try parent dist directory
+  const parentJs = path.join(__dirname, '..', 'sql-wasm.js');
+  if (fs.existsSync(parentJs)) {
+    try {
+      const mod = require(parentJs);
+      return typeof mod === 'function' ? mod : mod.default || mod;
+    } catch {}
+  }
+
+  throw new Error("Cannot find module 'sql.js' or bundled sql-wasm.js runtime");
+}
 
 /**
  * Initializes sql.js with robust locateFile resolution.
@@ -14,6 +46,7 @@ let sqlJsPromise: Promise<SqlJsStatic> | null = null;
  */
 export async function getSqlInstance(): Promise<SqlJsStatic> {
   if (!sqlJsPromise) {
+    const initSqlJs = resolveSqlJsFactory();
     sqlJsPromise = initSqlJs({
       locateFile: (file: string) => {
         // Check dist folder relative to this file

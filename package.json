@@ -61,7 +61,7 @@
     "compile": "tsc -p ./ && node scripts/copy-wasm.js",
     "watch": "tsc -watch -p ./",
     "build-worker": "tsc src/cli/switchWorker.ts --outDir dist/cli --module commonjs --target es2022 --moduleResolution node --esModuleInterop",
-    "package": "npx @vscode/vsce package --no-dependencies"
+    "package": "npx @vscode/vsce package"
   },
   "dependencies": {
     "sql.js": "^1.10.3"

@@ -11,20 +11,47 @@ export class SecurityError extends Error {
 }
 
 /**
+ * Resolves the genuine primary user home directory, even when USERPROFILE/HOME is overridden inside a sandbox.
+ */
+export function getRealPrimaryHome(): string {
+  try {
+    const userInfo = os.userInfo();
+    if (userInfo && userInfo.homedir) {
+      return path.resolve(userInfo.homedir);
+    }
+  } catch {}
+
+  if (process.env.ORIGINAL_USERPROFILE) {
+    return path.resolve(process.env.ORIGINAL_USERPROFILE);
+  }
+
+  const curHome = os.homedir();
+  const sandboxRoot = process.env.AG_SANDBOX_ROOT;
+  if (sandboxRoot && curHome.toLowerCase().startsWith(path.resolve(sandboxRoot).toLowerCase())) {
+    const sysDrive = process.env.SystemDrive || 'C:';
+    const userName = process.env.USERNAME || process.env.USER;
+    if (userName) {
+      return path.resolve(path.join(sysDrive, 'Users', userName));
+    }
+  }
+  return path.resolve(curHome);
+}
+
+/**
  * Returns primary system paths of the original untouched Antigravity installation.
  * Any access or modification to these paths from the switcher is strictly forbidden.
  */
-export function getForbiddenPrimaryPaths(): string[] {
+export function getForbiddenPrimaryPaths(sandboxRoot?: string): string[] {
   const forbidden: string[] = [];
-  const homeDir = os.homedir();
+  const homeDir = getRealPrimaryHome();
 
   // Primary user home caches
   forbidden.push(path.join(homeDir, '.gemini'));
   forbidden.push(path.join(homeDir, '.antigravity-cli'));
 
   if (process.platform === 'win32') {
-    const localAppData = process.env.LOCALAPPDATA || path.join(homeDir, 'AppData', 'Local');
-    const appData = process.env.APPDATA || path.join(homeDir, 'AppData', 'Roaming');
+    const localAppData = path.join(homeDir, 'AppData', 'Local');
+    const appData = path.join(homeDir, 'AppData', 'Roaming');
 
     forbidden.push(path.join(localAppData, 'Programs', 'Antigravity'));
     forbidden.push(path.join(localAppData, 'Programs', 'Antigravity IDE'));
@@ -39,12 +66,20 @@ export function getForbiddenPrimaryPaths(): string[] {
     // Linux
     forbidden.push('/opt/Antigravity');
     forbidden.push('/usr/share/antigravity');
-    const configDir = process.env.XDG_CONFIG_HOME || path.join(homeDir, '.config');
+    const configDir = path.join(homeDir, '.config');
     forbidden.push(path.join(configDir, 'Antigravity'));
     forbidden.push(path.join(configDir, 'Antigravity IDE'));
   }
 
-  return forbidden.map(p => path.resolve(p).toLowerCase());
+  const normalized = forbidden.map(p => path.resolve(p).toLowerCase());
+
+  // Filter out any paths that may happen to fall inside the isolated sandbox
+  if (sandboxRoot) {
+    const resolvedRoot = path.resolve(sandboxRoot).toLowerCase();
+    return normalized.filter(p => !p.startsWith(resolvedRoot));
+  }
+
+  return normalized;
 }
 
 /**
@@ -122,23 +157,24 @@ export function assertInsideSandbox(
     return;
   }
 
-  // Check 1: Forbidden primary system paths check (mutation strictly blocked)
-  const forbidden = getForbiddenPrimaryPaths();
+  // Check 1: Target must reside within sandbox root prefix
+  const rootWithSep = root.endsWith(path.sep) ? root : root + path.sep;
+  const isInsideSandbox = resolvedTarget === root || resolvedTarget.startsWith(rootWithSep);
+
+  if (!isInsideSandbox) {
+    throw new SecurityError(
+      `Security Violation: Attempted to touch path outside of SandboxRoot! [Root: ${root}, Target: ${targetPath}]`
+    );
+  }
+
+  // Check 2: Forbidden primary system paths check (mutation of real system installation is strictly blocked)
+  const forbidden = getForbiddenPrimaryPaths(root);
   for (const forb of forbidden) {
     if (resolvedTarget.startsWith(forb)) {
       throw new SecurityError(
         `Security Violation: Target path is inside forbidden primary Antigravity system directory! [Target: ${targetPath}]`
       );
     }
-  }
-
-  // Check 2: Target must reside within sandbox root prefix
-  // Allow exact root or child of root
-  const rootWithSep = root.endsWith(path.sep) ? root : root + path.sep;
-  if (resolvedTarget !== root && !resolvedTarget.startsWith(rootWithSep)) {
-    throw new SecurityError(
-      `Security Violation: Attempted to touch path outside of SandboxRoot! [Root: ${root}, Target: ${targetPath}]`
-    );
   }
 }
 

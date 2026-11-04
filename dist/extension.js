@@ -157,11 +157,17 @@ async function handleManualRefreshQuota(sandboxRoot) {
         }
         const email = status.email || (0, profileStore_1.loadConfig)(sandboxRoot).activeProfile;
         if (email) {
-            // Update stored profile quota snapshot
-            const profile = (0, profileStore_1.getProfile)(sandboxRoot, email) || (await (0, profileStore_1.captureCurrentProfile)(sandboxRoot, email));
+            // Update stored profile quota snapshot with fresh live status
+            let profile = (0, profileStore_1.getProfile)(sandboxRoot, email);
             if (profile) {
-                updateStatusBarPassive(sandboxRoot);
+                profile.quotas = (0, profileStore_1.buildQuotaSnapshot)(status);
+                profile.lastUsedAt = new Date().toISOString();
+                (0, profileStore_1.saveProfile)(sandboxRoot, profile);
             }
+            else {
+                profile = await (0, profileStore_1.captureCurrentProfile)(sandboxRoot, email);
+            }
+            updateStatusBarPassive(sandboxRoot);
         }
         vscode.window.showInformationMessage(`Quota refreshed for ${status.email}: Min remaining: ${status.minQuotaPercentage}%`);
         updateStatusBarPassive(sandboxRoot);
@@ -382,10 +388,15 @@ async function triggerSwitchWorker(context, sandboxRoot, targetEmail) {
         '--target', targetEmail,
         '--ide-pid', String(process.pid),
     ];
+    const spawnEnv = {
+        ...process.env,
+        ELECTRON_RUN_AS_NODE: '1',
+    };
     try {
         const child = (0, child_process_1.spawn)(nodeExec, args, {
             detached: true,
             stdio: 'ignore',
+            env: spawnEnv,
             windowsHide: false,
         });
         child.unref();

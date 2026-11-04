@@ -34,10 +34,14 @@ var __importStar = (this && this.__importStar) || (function () {
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.extractCsrfToken = extractCsrfToken;
+exports.findServerPortsFromLogFile = findServerPortsFromLogFile;
 exports.findPortFromLogFile = findPortFromLogFile;
+exports.resolveSandboxServerPorts = resolveSandboxServerPorts;
+exports.executeRpcCall = executeRpcCall;
 exports.findListeningPortForPid = findListeningPortForPid;
 exports.getLocalUserStatus = getLocalUserStatus;
 exports.getAllCascadeTrajectories = getAllCascadeTrajectories;
+exports.getCascadeTrajectory = getCascadeTrajectory;
 const https = __importStar(require("https"));
 const http = __importStar(require("http"));
 const fs = __importStar(require("fs"));
@@ -58,15 +62,13 @@ function extractCsrfToken(commandLine) {
     return null;
 }
 /**
- * Resolves the port from language_server.log.
- * On Windows Antigravity IDE, language_server connects as Host-Bridge (all sockets show ESTABLISHED in netstat).
- * The port is reliably written to AppData/Roaming/Antigravity/logs/language_server.log at startup:
- * "Language server listening on random port at <PORT> for HTTPS (gRPC)"
- * "Language server listening on random port at <PORT> for HTTP"
+ * Resolves the ports from language_server.log.
+ * Explicitly separates HTTPS (gRPC) port and HTTP port to eliminate SSL handshake failures.
  */
-function findPortFromLogFile(logPath, pid) {
+function findServerPortsFromLogFile(logPath, pid) {
+    const result = { httpsPort: null, httpPort: null };
     if (!fs.existsSync(logPath)) {
-        return null;
+        return result;
     }
     try {
         const stats = fs.statSync(logPath);
@@ -83,21 +85,88 @@ function findPortFromLogFile(logPath, pid) {
             fs.closeSync(fd);
             content = headBuf.toString('utf8') + '\n' + tailBuf.toString('utf8');
         }
+        let searchContent = content;
         if (pid && pid > 0) {
-            const pidRegex = new RegExp(`Starting language server process with pid ${pid}[\\s\\S]{1,1500}?Language server listening on random port at (\\d+)`, 'i');
+            const pidRegex = new RegExp(`Starting language server process with pid ${pid}[\\s\\S]{1,3000}`, 'i');
             const pidMatch = content.match(pidRegex);
-            if (pidMatch && pidMatch[1]) {
-                return parseInt(pidMatch[1], 10);
+            if (pidMatch) {
+                searchContent = pidMatch[0];
             }
         }
-        const matches = Array.from(content.matchAll(/Language server listening on random port at (\d+) for (?:HTTPS|HTTP)/gi));
-        if (matches.length > 0) {
-            const lastMatch = matches[matches.length - 1];
-            return parseInt(lastMatch[1], 10);
+        const httpsMatches = Array.from(searchContent.matchAll(/Language server listening on random port at (\d+) for HTTPS/gi));
+        if (httpsMatches.length > 0) {
+            result.httpsPort = parseInt(httpsMatches[httpsMatches.length - 1][1], 10);
+        }
+        const httpMatches = Array.from(searchContent.matchAll(/Language server listening on random port at (\d+) for HTTP/gi));
+        if (httpMatches.length > 0) {
+            result.httpPort = parseInt(httpMatches[httpMatches.length - 1][1], 10);
         }
     }
     catch {
         // Read failed
+    }
+    return result;
+}
+/**
+ * Backward compatibility alias: returns httpsPort or httpPort.
+ */
+function findPortFromLogFile(logPath, pid) {
+    const ports = findServerPortsFromLogFile(logPath, pid);
+    return ports.httpsPort || ports.httpPort;
+}
+/**
+ * Resolves the server ports (HTTPS and HTTP) belonging to this sandbox instance.
+ */
+async function resolveSandboxServerPorts(sandboxRoot, pid) {
+    try {
+        const paths = (0, paths_1.getSandboxPaths)(sandboxRoot);
+        const candidateLogs = [
+            path.join(paths.sandboxHome, 'AppData', 'Roaming', 'Antigravity', 'logs', 'language_server.log'),
+            path.join(paths.userDataDir, 'logs', 'language_server.log'),
+            path.join(paths.sandboxHome, '.antigravity-cli', 'log', 'language_server.log'),
+        ];
+        for (const logFile of candidateLogs) {
+            const ports = findServerPortsFromLogFile(logFile, pid);
+            if (ports.httpsPort || ports.httpPort) {
+                return ports;
+            }
+        }
+    }
+    catch {
+        // Path resolution failed
+    }
+    // Fallback to netstat / lsof
+    if (pid && pid > 0) {
+        const fallbackPort = await findListeningPortForPid(pid, sandboxRoot);
+        if (fallbackPort) {
+            return { httpsPort: fallbackPort, httpPort: fallbackPort };
+        }
+    }
+    return { httpsPort: null, httpPort: null };
+}
+/**
+ * Executes an RPC call targeting HTTPS port first if known, or HTTP port directly.
+ * Eliminates SSL handshake resets caused by sending HTTPS requests to an HTTP port.
+ */
+async function executeRpcCall(ports, endpoint, csrfToken, requestBody) {
+    // Try HTTPS port first
+    if (ports.httpsPort) {
+        try {
+            return await sendLocalPostRequest(ports.httpsPort, endpoint, csrfToken, requestBody, true);
+        }
+        catch {
+            // Fall through to HTTP if HTTPS fails
+        }
+    }
+    // Connect via HTTP to httpPort (or fallback httpsPort if only one is known)
+    const httpTargetPort = ports.httpPort || ports.httpsPort;
+    if (httpTargetPort) {
+        try {
+            return await sendLocalPostRequest(httpTargetPort, endpoint, csrfToken, requestBody, false);
+        }
+        catch {
+            return null;
+        }
     }
     return null;
 }
@@ -242,8 +311,8 @@ async function getLocalUserStatus(sandboxRoot) {
     if (!csrfToken) {
         return null;
     }
-    const port = await findListeningPortForPid(lsProc.pid, sandboxRoot);
-    if (!port) {
+    const ports = await resolveSandboxServerPorts(sandboxRoot, lsProc.pid);
+    if (!ports.httpsPort && !ports.httpPort) {
         return null;
     }
     const requestBody = {
@@ -253,20 +322,8 @@ async function getLocalUserStatus(sandboxRoot) {
             locale: 'en',
         },
     };
-    let responseData;
     const endpoint = '/exa.language_server_pb.LanguageServerService/GetUserStatus';
-    // Try HTTPS first, then fallback to HTTP
-    try {
-        responseData = await sendLocalPostRequest(port, endpoint, csrfToken, requestBody, true);
-    }
-    catch {
-        try {
-            responseData = await sendLocalPostRequest(port, endpoint, csrfToken, requestBody, false);
-        }
-        catch {
-            return null;
-        }
-    }
+    const responseData = await executeRpcCall(ports, endpoint, csrfToken, requestBody);
     if (!responseData) {
         return null;
     }
@@ -317,7 +374,7 @@ async function getLocalUserStatus(sandboxRoot) {
     };
 }
 /**
- * Fetches all cascade trajectories strictly via local RPC on 127.0.0.1.
+ * Fetches all cascade trajectories metadata map strictly via local RPC on 127.0.0.1.
  * Returns null if language_server is offline or uncontactable.
  */
 async function getAllCascadeTrajectories(sandboxRoot) {
@@ -329,8 +386,8 @@ async function getAllCascadeTrajectories(sandboxRoot) {
     if (!csrfToken) {
         return null;
     }
-    const port = await findListeningPortForPid(lsProc.pid, sandboxRoot);
-    if (!port) {
+    const ports = await resolveSandboxServerPorts(sandboxRoot, lsProc.pid);
+    if (!ports.httpsPort && !ports.httpPort) {
         return null;
     }
     const requestBody = {
@@ -341,16 +398,34 @@ async function getAllCascadeTrajectories(sandboxRoot) {
         },
     };
     const endpoint = '/exa.language_server_pb.LanguageServerService/GetAllCascadeTrajectories';
-    try {
-        return await sendLocalPostRequest(port, endpoint, csrfToken, requestBody, true);
+    return await executeRpcCall(ports, endpoint, csrfToken, requestBody);
+}
+/**
+ * Fetches a single cascade trajectory with full steps, generatorMetadata, and actual token usages.
+ * Returns null if language_server is offline or trajectory is not found.
+ */
+async function getCascadeTrajectory(sandboxRoot, cascadeId) {
+    const lsProc = await (0, processManager_1.findSandboxLanguageServer)(sandboxRoot);
+    if (!lsProc) {
+        return null;
     }
-    catch {
-        try {
-            return await sendLocalPostRequest(port, endpoint, csrfToken, requestBody, false);
-        }
-        catch {
-            return null;
-        }
+    const csrfToken = extractCsrfToken(lsProc.commandLine);
+    if (!csrfToken) {
+        return null;
     }
+    const ports = await resolveSandboxServerPorts(sandboxRoot, lsProc.pid);
+    if (!ports.httpsPort && !ports.httpPort) {
+        return null;
+    }
+    const requestBody = {
+        metadata: {
+            ideName: 'antigravity',
+            extensionName: 'antigravity',
+            locale: 'en',
+        },
+        cascadeId,
+    };
+    const endpoint = '/exa.language_server_pb.LanguageServerService/GetCascadeTrajectory';
+    return await executeRpcCall(ports, endpoint, csrfToken, requestBody);
 }
 //# sourceMappingURL=lsRpcClient.js.map

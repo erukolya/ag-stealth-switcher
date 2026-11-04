@@ -7,6 +7,27 @@ import { getSandboxPaths } from './paths';
 
 const execAsync = promisify(exec);
 
+/**
+ * Runs a PowerShell script reliably using -EncodedCommand (UTF-16LE Base64).
+ * Eliminates all command-line quoting, whitespace, and variable expansion bugs on Windows.
+ */
+function runPowerShellScript(script: string): Promise<string> {
+  const encoded = Buffer.from(script, 'utf16le').toString('base64');
+  return new Promise((resolve, reject) => {
+    exec(
+      `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ${encoded}`,
+      { windowsHide: true, maxBuffer: 10 * 1024 * 1024 },
+      (err, stdout) => {
+        if (err) {
+          reject(err);
+        } else {
+          resolve(stdout || '');
+        }
+      }
+    );
+  });
+}
+
 export interface SandboxProcessInfo {
   pid: number;
   name: string;
@@ -15,8 +36,44 @@ export interface SandboxProcessInfo {
 }
 
 /**
+ * Validates whether a process strictly belongs to the sandbox instance.
+ * Strict rule: Binary must reside in <SandboxRoot>/App/, OR be a recognized Antigravity
+ * binary explicitly bound to this sandbox's userDataDir.
+ * NEVER matches general text editors, shells, or external IDEs.
+ */
+export function isProcessBelongingToSandbox(
+  exePath: string,
+  procName: string,
+  cmdLine: string,
+  appPrefix: string,
+  userDataPrefix: string
+): boolean {
+  const exeLower = exePath.toLowerCase();
+  const nameLower = procName.toLowerCase();
+  const cmdLower = cmdLine.toLowerCase();
+
+  // 1. Strict primary rule: Executable is located inside <SandboxRoot>/App/
+  if (exeLower.startsWith(appPrefix)) {
+    return true;
+  }
+
+  // 2. Strict secondary rule: Specific Antigravity binary explicitly tied to this sandbox userDataDir
+  const isAntigravityBinary =
+    nameLower.includes('antigravity') ||
+    nameLower.includes('language_server') ||
+    nameLower === 'agy.exe' ||
+    nameLower === 'agy';
+
+  if (isAntigravityBinary && userDataPrefix && cmdLower.includes(userDataPrefix)) {
+    return true;
+  }
+
+  return false;
+}
+
+/**
  * Lists all running processes that strictly belong to this Sandbox instance.
- * Filters strictly by executable path prefix (<SandboxRoot>/App) or command line arguments.
+ * Filters strictly by executable path prefix (<SandboxRoot>/App) or Antigravity binary + userDataDir.
  */
 export async function listSandboxProcesses(sandboxRoot: string): Promise<SandboxProcessInfo[]> {
   const resolvedRoot = path.resolve(sandboxRoot);
@@ -24,27 +81,22 @@ export async function listSandboxProcesses(sandboxRoot: string): Promise<Sandbox
 
   const paths = getSandboxPaths(resolvedRoot);
   const appPrefix = paths.appDir.toLowerCase();
-  const rootPrefix = resolvedRoot.toLowerCase();
+  const userDataPrefix = paths.userDataDir.toLowerCase();
   const results: SandboxProcessInfo[] = [];
 
   if (process.platform === 'win32') {
     // PowerShell CIM query with strict prefix matching
     const escapedAppPrefix = paths.appDir.replace(/'/g, "''");
-    const escapedRootPrefix = resolvedRoot.replace(/'/g, "''");
 
     const psCommand = `
       $procs = Get-CimInstance Win32_Process | Where-Object {
-        ($_.ExecutablePath -ne $null -and $_.ExecutablePath.StartsWith('${escapedAppPrefix}', [System.StringComparison]::OrdinalIgnoreCase)) -or
-        ($_.CommandLine -ne $null -and ($_.CommandLine.IndexOf('${escapedRootPrefix}', [System.StringComparison]::OrdinalIgnoreCase) -ge 0))
-      } | Select-Object @{Name='pid';Expression={$_.ProcessId}}, @{Name='name';Expression={$_.Name}}, @{Name='executablePath';Expression={$_.ExecutablePath}}, @{Name='commandLine';Expression={$_.CommandLine}}
+        ($_.ExecutablePath -ne $null -and $_.ExecutablePath.StartsWith('${escapedAppPrefix}', [System.StringComparison]::OrdinalIgnoreCase))
+      } | Select-Object ProcessId, Name, ExecutablePath, CommandLine
       if ($procs) { $procs | ConvertTo-Json -Compress } else { '[]' }
-    `.replace(/\r?\n\s*/g, ' ');
+    `;
 
     try {
-      const { stdout } = await execAsync(`powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "${psCommand}"`, {
-        windowsHide: true,
-        maxBuffer: 10 * 1024 * 1024,
-      });
+      const stdout = await runPowerShellScript(psCommand);
 
       const trimmed = stdout.trim();
       if (!trimmed || trimmed === '[]') {
@@ -55,20 +107,18 @@ export async function listSandboxProcesses(sandboxRoot: string): Promise<Sandbox
       const items = Array.isArray(parsed) ? parsed : [parsed];
 
       for (const item of items) {
-        if (!item || !item.pid) {
+        const pid = Number(item.ProcessId || item.pid);
+        if (!pid) {
           continue;
         }
-        const exePath = String(item.executablePath || '');
-        const cmdLine = String(item.commandLine || '');
+        const exePath = String(item.ExecutablePath || item.executablePath || '');
+        const name = String(item.Name || item.name || '');
+        const cmdLine = String(item.CommandLine || item.commandLine || '');
 
-        // Double check in JS to ensure zero leakage
-        const exeLower = exePath.toLowerCase();
-        const cmdLower = cmdLine.toLowerCase();
-
-        if (exeLower.startsWith(appPrefix) || cmdLower.includes(rootPrefix)) {
+        if (isProcessBelongingToSandbox(exePath, name, cmdLine, appPrefix, userDataPrefix)) {
           results.push({
-            pid: Number(item.pid),
-            name: String(item.name || ''),
+            pid,
+            name,
             executablePath: exePath,
             commandLine: cmdLine,
           });
@@ -76,7 +126,7 @@ export async function listSandboxProcesses(sandboxRoot: string): Promise<Sandbox
       }
     } catch (err) {
       // If CIM fails, fallback to tasklist-based parsing
-      return await fallbackListWindowsProcesses(paths.appDir, resolvedRoot);
+      return await fallbackListWindowsProcesses(paths.appDir, paths.userDataDir);
     }
   } else {
     // macOS / Linux POSIX process scanning
@@ -108,14 +158,7 @@ export async function listSandboxProcesses(sandboxRoot: string): Promise<Sandbox
           }
         }
 
-        const exeLower = exePath.toLowerCase();
-        const cmdLower = cmdLine.toLowerCase();
-
-        if (
-          (exeLower && exeLower.startsWith(appPrefix)) ||
-          cmdLower.includes(appPrefix) ||
-          cmdLower.includes(rootPrefix)
-        ) {
+        if (isProcessBelongingToSandbox(exePath || name, name, cmdLine, appPrefix, userDataPrefix)) {
           results.push({
             pid,
             name,
@@ -136,20 +179,14 @@ export async function listSandboxProcesses(sandboxRoot: string): Promise<Sandbox
  * Fallback for Windows if PowerShell CIM is restricted.
  * Uses native PowerShell Get-Process (100% compatible with Windows 11 24H2+ where wmic is removed).
  */
-async function fallbackListWindowsProcesses(appDir: string, rootDir: string): Promise<SandboxProcessInfo[]> {
+async function fallbackListWindowsProcesses(appDir: string, userDataDir?: string): Promise<SandboxProcessInfo[]> {
   const results: SandboxProcessInfo[] = [];
   const appPrefix = appDir.toLowerCase();
-  const rootPrefix = rootDir.toLowerCase();
+  const userDataPrefix = userDataDir ? userDataDir.toLowerCase() : '';
 
   try {
-    const psCmd = `Get-Process | Where-Object { $_.Path -ne $null } | Select-Object @{Name='pid';Expression={$_.Id}}, @{Name='name';Expression={$_.ProcessName}}, @{Name='executablePath';Expression={$_.Path}}, @{Name='commandLine';Expression={''}} | ConvertTo-Json -Compress`;
-    const { stdout } = await execAsync(
-      `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "${psCmd}"`,
-      {
-        windowsHide: true,
-        maxBuffer: 10 * 1024 * 1024,
-      }
-    );
+    const psCmd = `Get-Process | Where-Object { $_.Path -ne $null } | Select-Object ProcessId, ProcessName, Path | ConvertTo-Json -Compress`;
+    const stdout = await runPowerShellScript(psCmd);
 
     const trimmed = stdout.trim();
     if (!trimmed || trimmed === '[]') {
@@ -160,18 +197,19 @@ async function fallbackListWindowsProcesses(appDir: string, rootDir: string): Pr
     const items = Array.isArray(parsed) ? parsed : [parsed];
 
     for (const item of items) {
-      if (!item || !item.pid) {
+      const pid = Number(item.ProcessId || item.Id || item.pid);
+      if (!pid) {
         continue;
       }
-      const exePath = String(item.executablePath || '');
-      const exeLower = exePath.toLowerCase();
+      const exePath = String(item.Path || item.executablePath || '');
+      const name = String(item.ProcessName || item.name || '');
 
-      if (exeLower.startsWith(appPrefix) || exeLower.includes(rootPrefix)) {
+      if (isProcessBelongingToSandbox(exePath, name, '', appPrefix, userDataPrefix)) {
         results.push({
-          pid: Number(item.pid),
-          name: String(item.name || ''),
+          pid,
+          name,
           executablePath: exePath,
-          commandLine: String(item.commandLine || ''),
+          commandLine: '',
         });
       }
     }
@@ -187,6 +225,28 @@ async function fallbackListWindowsProcesses(appDir: string, rootDir: string): Pr
  * Supports language_server.exe, language_server_windows_x64.exe, agy.exe, and hub processes.
  */
 export async function findSandboxLanguageServer(sandboxRoot: string): Promise<SandboxProcessInfo | null> {
+  // Test hook: allows integration tests to target an active language server without spawning a full sandbox
+  if (process.env.AG_TEST_FORCE_PID) {
+    const forcePid = parseInt(process.env.AG_TEST_FORCE_PID, 10);
+    if (forcePid > 0) {
+      if (process.platform === 'win32') {
+        try {
+          const psCommand = `Get-CimInstance Win32_Process -Filter "ProcessId = ${forcePid}" | Select-Object ProcessId, Name, ExecutablePath, CommandLine | ConvertTo-Json -Compress`;
+          const stdout = await runPowerShellScript(psCommand);
+          const parsed = JSON.parse(stdout.trim());
+          if (parsed && (parsed.ProcessId || parsed.pid)) {
+            return {
+              pid: parsed.ProcessId || parsed.pid,
+              name: parsed.Name || parsed.name || '',
+              executablePath: parsed.ExecutablePath || parsed.executablePath || '',
+              commandLine: parsed.CommandLine || parsed.commandLine || '',
+            };
+          }
+        } catch {}
+      }
+    }
+  }
+
   const procs = await listSandboxProcesses(sandboxRoot);
   for (const proc of procs) {
     const nameLower = proc.name.toLowerCase();

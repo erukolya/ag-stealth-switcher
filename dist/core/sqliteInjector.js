@@ -32,9 +32,6 @@ var __importStar = (this && this.__importStar) || (function () {
         return result;
     };
 })();
-var __importDefault = (this && this.__importDefault) || function (mod) {
-    return (mod && mod.__esModule) ? mod : { "default": mod };
-};
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.getSqlInstance = getSqlInstance;
 exports.sanitizeSqliteBuffer = sanitizeSqliteBuffer;
@@ -44,9 +41,39 @@ exports.injectAuthItemsIntoDb = injectAuthItemsIntoDb;
 exports.clearAuthItemsInDb = clearAuthItemsInDb;
 const fs = __importStar(require("fs"));
 const path = __importStar(require("path"));
-const sql_js_1 = __importDefault(require("sql.js"));
 const sandboxEnv_1 = require("./sandboxEnv");
 let sqlJsPromise = null;
+/**
+ * Resolves the sql.js initialization factory function.
+ * Supports standard module resolution and local bundled sql-wasm.js fallback.
+ */
+function resolveSqlJsFactory() {
+    // 1. Try standard require('sql.js')
+    try {
+        const mod = require('sql.js');
+        return typeof mod === 'function' ? mod : mod.default || mod;
+    }
+    catch { }
+    // 2. Try locally bundled sql-wasm.js in same directory
+    const localJs = path.join(__dirname, 'sql-wasm.js');
+    if (fs.existsSync(localJs)) {
+        try {
+            const mod = require(localJs);
+            return typeof mod === 'function' ? mod : mod.default || mod;
+        }
+        catch { }
+    }
+    // 3. Try parent dist directory
+    const parentJs = path.join(__dirname, '..', 'sql-wasm.js');
+    if (fs.existsSync(parentJs)) {
+        try {
+            const mod = require(parentJs);
+            return typeof mod === 'function' ? mod : mod.default || mod;
+        }
+        catch { }
+    }
+    throw new Error("Cannot find module 'sql.js' or bundled sql-wasm.js runtime");
+}
 /**
  * Initializes sql.js with robust locateFile resolution.
  * Looks for sql-wasm.wasm in:
@@ -56,7 +83,8 @@ let sqlJsPromise = null;
  */
 async function getSqlInstance() {
     if (!sqlJsPromise) {
-        sqlJsPromise = (0, sql_js_1.default)({
+        const initSqlJs = resolveSqlJsFactory();
+        sqlJsPromise = initSqlJs({
             locateFile: (file) => {
                 // Check dist folder relative to this file
                 const localDist = path.join(__dirname, file);

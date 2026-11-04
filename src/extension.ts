@@ -7,7 +7,9 @@ import { getLocalUserStatus } from './core/lsRpcClient';
 import {
   listProfiles,
   getProfile,
+  saveProfile,
   captureCurrentProfile,
+  buildQuotaSnapshot,
   loadConfig,
   saveConfig,
   deleteProfile,
@@ -174,11 +176,16 @@ async function handleManualRefreshQuota(sandboxRoot: string): Promise<void> {
 
       const email = status.email || loadConfig(sandboxRoot).activeProfile;
       if (email) {
-        // Update stored profile quota snapshot
-        const profile = getProfile(sandboxRoot, email) || (await captureCurrentProfile(sandboxRoot, email));
+        // Update stored profile quota snapshot with fresh live status
+        let profile = getProfile(sandboxRoot, email);
         if (profile) {
-          updateStatusBarPassive(sandboxRoot);
+          profile.quotas = buildQuotaSnapshot(status);
+          profile.lastUsedAt = new Date().toISOString();
+          saveProfile(sandboxRoot, profile);
+        } else {
+          profile = await captureCurrentProfile(sandboxRoot, email);
         }
+        updateStatusBarPassive(sandboxRoot);
       }
 
       vscode.window.showInformationMessage(
@@ -464,10 +471,16 @@ async function triggerSwitchWorker(
     '--ide-pid', String(process.pid),
   ];
 
+  const spawnEnv: NodeJS.ProcessEnv = {
+    ...process.env,
+    ELECTRON_RUN_AS_NODE: '1',
+  };
+
   try {
     const child = spawn(nodeExec, args, {
       detached: true,
       stdio: 'ignore',
+      env: spawnEnv,
       windowsHide: false,
     });
     child.unref();

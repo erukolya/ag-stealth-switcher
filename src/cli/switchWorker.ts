@@ -1,6 +1,6 @@
 import * as path from 'path';
 import * as fs from 'fs';
-import { spawn } from 'child_process';
+import { spawn, execSync } from 'child_process';
 import { getSandboxPaths } from '../core/paths';
 import { assertInsideSandbox, getIsolatedEnv } from '../core/sandboxEnv';
 import { terminateSandboxIdeProcesses, sweepSandboxOrphanServers, sleep } from '../core/processManager';
@@ -67,18 +67,61 @@ function logWorker(sandboxRoot: string, message: string): void {
   }
 }
 
-function cleanupOrphanWalFiles(dbPath: string): void {
+/**
+ * Safely checkpoints SQLite WAL file into the main database before touching state.vscdb.
+ * Adheres strictly to sqlite.org guidelines: NEVER delete a non-empty -wal without checkpointing,
+ * as doing so destroys uncommitted and committed transactions.
+ */
+function safeCheckpointAndConsolidateWal(dbPath: string, sandboxRoot: string): void {
   const walPath = `${dbPath}-wal`;
   const shmPath = `${dbPath}-shm`;
+
+  if (!fs.existsSync(walPath)) {
+    return;
+  }
+
   try {
+    const stat = fs.statSync(walPath);
+    if (stat.size === 0) {
+      // WAL is already 0 bytes, safe to remove cleanly
+      try { fs.unlinkSync(walPath); } catch {}
+      try { fs.unlinkSync(shmPath); } catch {}
+      return;
+    }
+
+    logWorker(sandboxRoot, `Pending WAL detected (${stat.size} bytes). Executing PRAGMA wal_checkpoint(TRUNCATE)...`);
+
+    // Strategy 1: Native Node.js DatabaseSync (built-in in Node 22+)
+    try {
+      const { DatabaseSync } = require('node:sqlite');
+      if (typeof DatabaseSync === 'function') {
+        const syncDb = new DatabaseSync(dbPath);
+        syncDb.exec('PRAGMA wal_checkpoint(TRUNCATE);');
+        syncDb.close();
+      }
+    } catch {}
+
+    // Strategy 2: Python sqlite3 fallback
+    if (fs.existsSync(walPath) && fs.statSync(walPath).size > 0) {
+      try {
+        const pyScript = `import sqlite3; c=sqlite3.connect(r'${dbPath}'); c.execute('PRAGMA wal_checkpoint(TRUNCATE);'); c.close()`;
+        execSync(`python -c "${pyScript}"`, { windowsHide: true, timeout: 3000 });
+      } catch {}
+    }
+
+    // Verify checkpoint result
     if (fs.existsSync(walPath)) {
-      fs.unlinkSync(walPath);
+      const postStat = fs.statSync(walPath);
+      if (postStat.size === 0) {
+        logWorker(sandboxRoot, 'WAL checkpoint completed successfully. 0 bytes remaining.');
+        try { fs.unlinkSync(walPath); } catch {}
+        try { fs.unlinkSync(shmPath); } catch {}
+      } else {
+        logWorker(sandboxRoot, `Warning: WAL retained ${postStat.size} bytes. Preserving WAL file to prevent SQLite data loss.`);
+      }
     }
-    if (fs.existsSync(shmPath)) {
-      fs.unlinkSync(shmPath);
-    }
-  } catch {
-    // Best-effort cleanup
+  } catch (err: any) {
+    logWorker(sandboxRoot, `Warning during WAL checkpoint: ${err.message || err}`);
   }
 }
 
@@ -89,11 +132,26 @@ async function main(): Promise<void> {
   assertInsideSandbox(sandboxRoot, sandboxRoot);
   logWorker(sandboxRoot, `Switch worker started: mode=${mode}, target=${target}, idePid=${idePid || 'N/A'}`);
 
-  // 1. Terminate running sandbox processes
-  logWorker(sandboxRoot, 'Terminating running sandbox IDE and language_server processes...');
-  await terminateSandboxIdeProcesses(sandboxRoot, 5000);
+  // 1. Wait gracefully for the parent IDE to flush databases and checkpoint WAL files
+  if (idePid && idePid > 0) {
+    logWorker(sandboxRoot, `Waiting for IDE PID ${idePid} to gracefully flush and exit...`);
+    const graceStart = Date.now();
+    while (Date.now() - graceStart < 4000) {
+      try {
+        process.kill(idePid, 0);
+        await sleep(200);
+      } catch {
+        logWorker(sandboxRoot, `IDE PID ${idePid} exited gracefully.`);
+        break;
+      }
+    }
+  }
+
+  // 2. Ensure all lingering sandbox processes are terminated and DB lock released
+  logWorker(sandboxRoot, 'Ensuring sandbox processes are stopped and state locks freed...');
+  await terminateSandboxIdeProcesses(sandboxRoot, 4000);
   await sweepSandboxOrphanServers(sandboxRoot);
-  await sleep(600);
+  await sleep(400);
 
   const paths = getSandboxPaths(sandboxRoot);
   const isBlank = target === '__BLANK__';
@@ -103,12 +161,12 @@ async function main(): Promise<void> {
 
   if (mode === 'in-place') {
     logWorker(sandboxRoot, 'Executing in-place profile swap...');
-    cleanupOrphanWalFiles(paths.stateVscdb);
+    safeCheckpointAndConsolidateWal(paths.stateVscdb, sandboxRoot);
 
     if (isBlank) {
       logWorker(sandboxRoot, 'Clearing credentials for blank login session...');
       await clearAuthItemsInDb(paths.stateVscdb, sandboxRoot);
-      cleanupOrphanWalFiles(paths.stateVscdb);
+      safeCheckpointAndConsolidateWal(paths.stateVscdb, sandboxRoot);
 
       // Generate new isolated telemetry identifiers
       const newTelemetry = generateFreshTelemetry();
@@ -134,7 +192,7 @@ async function main(): Promise<void> {
 
       logWorker(sandboxRoot, `Injecting credentials and telemetry for: ${profile.email}`);
       await injectAuthItemsIntoDb(paths.stateVscdb, profile.dbItems, sandboxRoot, profile.telemetry.devDeviceId);
-      cleanupOrphanWalFiles(paths.stateVscdb);
+      safeCheckpointAndConsolidateWal(paths.stateVscdb, sandboxRoot);
       writeTelemetry(paths.storageJson, profile.telemetry, sandboxRoot);
 
       if (profile.cliToken) {
@@ -160,12 +218,12 @@ async function main(): Promise<void> {
 
     const isolatedStorageJson = path.join(userData, 'User', 'globalStorage', 'storage.json');
     const isolatedVscdb = path.join(userData, 'User', 'globalStorage', 'state.vscdb');
-    cleanupOrphanWalFiles(isolatedVscdb);
+    safeCheckpointAndConsolidateWal(isolatedVscdb, sandboxRoot);
 
     if (isBlank) {
       logWorker(sandboxRoot, 'Setting up blank isolated directory...');
       await clearAuthItemsInDb(isolatedVscdb, sandboxRoot);
-      cleanupOrphanWalFiles(isolatedVscdb);
+      safeCheckpointAndConsolidateWal(isolatedVscdb, sandboxRoot);
       const newTelemetry = generateFreshTelemetry();
       writeTelemetry(isolatedStorageJson, newTelemetry, sandboxRoot);
       clearGeminiFileCredentials(userHome, sandboxRoot);
@@ -180,7 +238,7 @@ async function main(): Promise<void> {
       if (profile) {
         logWorker(sandboxRoot, `Populating isolated directory for: ${profile.email}`);
         await injectAuthItemsIntoDb(isolatedVscdb, profile.dbItems, sandboxRoot, profile.telemetry.devDeviceId);
-        cleanupOrphanWalFiles(isolatedVscdb);
+        safeCheckpointAndConsolidateWal(isolatedVscdb, sandboxRoot);
         writeTelemetry(isolatedStorageJson, profile.telemetry, sandboxRoot);
 
         const isolatedCliToken = path.join(userHome, '.antigravity-cli', 'oauth_token.json');

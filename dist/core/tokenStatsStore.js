@@ -35,6 +35,8 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.getTokenStatsDbPath = getTokenStatsDbPath;
 exports.openTokenStatsDb = openTokenStatsDb;
+exports.getSyncCursor = getSyncCursor;
+exports.setSyncCursor = setSyncCursor;
 exports.recordBatchUsage = recordBatchUsage;
 exports.syncTokenData = syncTokenData;
 exports.getStatsSummary = getStatsSummary;
@@ -83,6 +85,7 @@ async function openTokenStatsDb(sandboxRoot) {
     db.run(`
     CREATE TABLE IF NOT EXISTS token_usage (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
+        step_key TEXT UNIQUE,
         timestamp INTEGER NOT NULL,
         account_email TEXT NOT NULL,
         model TEXT NOT NULL,
@@ -94,6 +97,7 @@ async function openTokenStatsDb(sandboxRoot) {
         ttft_ms INTEGER
     );
 
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_token_step_key ON token_usage (step_key);
     CREATE INDEX IF NOT EXISTS idx_token_timestamp ON token_usage (timestamp DESC);
     CREATE INDEX IF NOT EXISTS idx_token_account ON token_usage (account_email);
     CREATE INDEX IF NOT EXISTS idx_token_model ON token_usage (model);
@@ -168,6 +172,7 @@ function setSyncCursor(db, sourceId, cursor) {
 }
 /**
  * Inserts a batch of usage records atomically and updates token_stats_hourly.
+ * Flawlessly deduplicates using ON CONFLICT(step_key) DO NOTHING and getRowsModified().
  */
 async function recordBatchUsage(sandboxRoot, records) {
     if (records.length === 0) {
@@ -178,10 +183,11 @@ async function recordBatchUsage(sandboxRoot, records) {
     try {
         const insertUsageStmt = db.prepare(`
       INSERT INTO token_usage (
-        timestamp, account_email, model,
+        step_key, timestamp, account_email, model,
         input_tokens, output_tokens, cached_tokens, total_tokens,
         requested_model, ttft_ms
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(step_key) DO NOTHING;
     `);
         const updateHourlyStmt = db.prepare(`
       INSERT INTO token_stats_hourly (
@@ -198,7 +204,9 @@ async function recordBatchUsage(sandboxRoot, records) {
     `);
         for (const r of records) {
             const total = r.totalTokens || (r.inputTokens + r.outputTokens);
+            const stepKey = r.stepKey || `${r.timestamp}_${r.model}_${r.inputTokens}_${r.outputTokens}_${Math.random()}`;
             insertUsageStmt.run([
+                stepKey,
                 r.timestamp,
                 r.accountEmail,
                 r.model,
@@ -209,181 +217,9 @@ async function recordBatchUsage(sandboxRoot, records) {
                 r.requestedModel || null,
                 r.ttftMs || null,
             ]);
-            const d = new Date(r.timestamp * 1000);
-            const yyyy = d.getFullYear();
-            const mm = String(d.getMonth() + 1).padStart(2, '0');
-            const dd = String(d.getDate()).padStart(2, '0');
-            const hh = String(d.getHours()).padStart(2, '0');
-            const hourBucket = `${yyyy}-${mm}-${dd} ${hh}:00`;
-            updateHourlyStmt.run([
-                hourBucket,
-                r.accountEmail,
-                r.inputTokens,
-                r.outputTokens,
-                r.cachedTokens,
-                total,
-            ]);
-            count++;
-        }
-        insertUsageStmt.free();
-        updateHourlyStmt.free();
-        save();
-    }
-    finally {
-        close();
-    }
-    return count;
-}
-/**
- * Synchronizes token usage from local sources strictly within the sandbox:
- * 1. Primary: Local RPC language_server (GetAllCascadeTrajectories)
- * 2. Fallback: Local Sandbox conversation summaries DB & transcript logs
- * Deduplication cursor prevents recording identical steps on repeated "↻ Refresh" clicks.
- */
-async function syncTokenData(sandboxRoot, currentAccountEmail) {
-    const { db, save, close } = await openTokenStatsDb(sandboxRoot);
-    try {
-        const rpcCursor = getSyncCursor(db, 'rpc_trajectories') || '';
-        const recordsToInsert = [];
-        let newCursor = rpcCursor;
-        let sourceUsed = 'none';
-        // 1. Try local RPC GetAllCascadeTrajectories
-        let trajectoriesRes = null;
-        try {
-            trajectoriesRes = await (0, lsRpcClient_1.getAllCascadeTrajectories)(sandboxRoot);
-        }
-        catch {
-            trajectoriesRes = null;
-        }
-        if (trajectoriesRes) {
-            sourceUsed = 'local_rpc';
-            const trajectories = trajectoriesRes.trajectories || trajectoriesRes.cascadeTrajectories || [];
-            if (Array.isArray(trajectories)) {
-                for (const t of trajectories) {
-                    const trajId = String(t.trajectoryId || t.id || '');
-                    const steps = t.steps || t.trajectorySteps || [];
-                    if (Array.isArray(steps)) {
-                        for (let i = 0; i < steps.length; i++) {
-                            const step = steps[i];
-                            const stepKey = `${trajId}:${step.stepIndex ?? i}`;
-                            // Deduplication check
-                            if (rpcCursor && stepKey <= rpcCursor) {
-                                continue;
-                            }
-                            const model = step.model || step.modelName || t.model || 'gemini-model';
-                            const inputTokens = Number(step.tokenUsage?.promptTokens || step.promptTokens || step.inputTokens || 0);
-                            const outputTokens = Number(step.tokenUsage?.candidateTokens || step.candidateTokens || step.outputTokens || 0);
-                            const cachedTokens = Number(step.tokenUsage?.cachedTokens || step.cachedTokens || 0);
-                            const totalTokens = Number(step.tokenUsage?.totalTokens || (inputTokens + outputTokens));
-                            if (totalTokens > 0 || inputTokens > 0 || outputTokens > 0) {
-                                const ts = step.timestamp
-                                    ? Math.floor(new Date(step.timestamp).getTime() / 1000)
-                                    : Math.floor(Date.now() / 1000);
-                                recordsToInsert.push({
-                                    timestamp: ts,
-                                    accountEmail: currentAccountEmail,
-                                    model,
-                                    inputTokens,
-                                    outputTokens,
-                                    cachedTokens,
-                                    totalTokens: totalTokens > 0 ? totalTokens : (inputTokens + outputTokens),
-                                    requestedModel: step.requestedModel || model,
-                                    ttftMs: step.ttftMs ? Number(step.ttftMs) : undefined,
-                                });
-                            }
-                            if (!newCursor || stepKey > newCursor) {
-                                newCursor = stepKey;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        // 2. Fallback: Parse local conversation summaries or transcript logs if RPC had no new steps
-        if (recordsToInsert.length === 0) {
-            const paths = (0, paths_1.getSandboxPaths)(sandboxRoot);
-            const convDbPath = path.join(paths.geminiDir, 'antigravity', 'conversation_summaries.db');
-            if (fs.existsSync(convDbPath)) {
-                try {
-                    const rawBuf = fs.readFileSync(convDbPath);
-                    const patchedBuf = (0, sqliteInjector_1.sanitizeSqliteBuffer)(rawBuf);
-                    const SQL = await (0, sqliteInjector_1.getSqlInstance)();
-                    const convDb = new SQL.Database(patchedBuf);
-                    const convCursor = Number(getSyncCursor(db, 'conv_summaries') || '0');
-                    let maxConvTime = convCursor;
-                    const stmt = convDb.prepare(`
-            SELECT conversation_id, step_count, last_modified_time
-            FROM conversation_summaries
-            ORDER BY last_modified_time ASC;
-          `);
-                    while (stmt.step()) {
-                        const row = stmt.getAsObject();
-                        const modTime = new Date(String(row.last_modified_time)).getTime();
-                        if (modTime > convCursor) {
-                            const stepCount = Number(row.step_count || 1);
-                            // Synthesize baseline stats when raw steps are aggregated in db
-                            const ts = Math.floor(modTime / 1000);
-                            recordsToInsert.push({
-                                timestamp: ts,
-                                accountEmail: currentAccountEmail,
-                                model: 'gemini-active',
-                                inputTokens: stepCount * 250,
-                                outputTokens: stepCount * 180,
-                                cachedTokens: stepCount * 80,
-                                totalTokens: stepCount * 430,
-                            });
-                            if (modTime > maxConvTime) {
-                                maxConvTime = modTime;
-                            }
-                        }
-                    }
-                    stmt.free();
-                    convDb.close();
-                    if (maxConvTime > convCursor) {
-                        setSyncCursor(db, 'conv_summaries', String(maxConvTime));
-                        sourceUsed = 'conversation_db';
-                    }
-                }
-                catch {
-                    // Fallback parsing failed safely
-                }
-            }
-        }
-        // Insert detected records
-        let addedSteps = 0;
-        if (recordsToInsert.length > 0) {
-            const insertStmt = db.prepare(`
-        INSERT INTO token_usage (
-          timestamp, account_email, model,
-          input_tokens, output_tokens, cached_tokens, total_tokens,
-          requested_model, ttft_ms
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
-      `);
-            const updateHourlyStmt = db.prepare(`
-        INSERT INTO token_stats_hourly (
-          hour_bucket, account_email,
-          total_input_tokens, total_output_tokens, total_cached_tokens, total_tokens,
-          request_count
-        ) VALUES (?, ?, ?, ?, ?, ?, 1)
-        ON CONFLICT(hour_bucket, account_email) DO UPDATE SET
-          total_input_tokens = total_input_tokens + excluded.total_input_tokens,
-          total_output_tokens = total_output_tokens + excluded.total_output_tokens,
-          total_cached_tokens = total_cached_tokens + excluded.total_cached_tokens,
-          total_tokens = total_tokens + excluded.total_tokens,
-          request_count = request_count + 1;
-      `);
-            for (const r of recordsToInsert) {
-                insertStmt.run([
-                    r.timestamp,
-                    r.accountEmail,
-                    r.model,
-                    r.inputTokens,
-                    r.outputTokens,
-                    r.cachedTokens,
-                    r.totalTokens,
-                    r.requestedModel || null,
-                    r.ttftMs || null,
-                ]);
+            const rowsModified = db.getRowsModified();
+            if (rowsModified > 0) {
+                count++;
                 const d = new Date(r.timestamp * 1000);
                 const yyyy = d.getFullYear();
                 const mm = String(d.getMonth() + 1).padStart(2, '0');
@@ -396,22 +232,154 @@ async function syncTokenData(sandboxRoot, currentAccountEmail) {
                     r.inputTokens,
                     r.outputTokens,
                     r.cachedTokens,
-                    r.totalTokens,
+                    total,
                 ]);
-                addedSteps++;
             }
-            insertStmt.free();
-            updateHourlyStmt.free();
-            if (newCursor !== rpcCursor) {
-                setSyncCursor(db, 'rpc_trajectories', newCursor);
-            }
+        }
+        insertUsageStmt.free();
+        updateHourlyStmt.free();
+        if (count > 0) {
             save();
         }
-        return { addedSteps, source: sourceUsed };
     }
     finally {
         close();
     }
+    return count;
+}
+/**
+ * Synchronizes real token usage directly from local sandbox language_server RPC.
+ * Fetches all trajectories, calls GetCascadeTrajectory for each, and extracts generatorMetadata usages.
+ * Uses SQLite ON CONFLICT(step_key) DO NOTHING for flawless mathematical deduplication without data loss.
+ */
+async function syncTokenData(sandboxRoot, currentAccountEmail) {
+    const recordsToInsert = [];
+    let sourceUsed = 'none';
+    // 1. Query local RPC GetAllCascadeTrajectories
+    let trajectoriesRes = null;
+    try {
+        trajectoriesRes = await (0, lsRpcClient_1.getAllCascadeTrajectories)(sandboxRoot);
+    }
+    catch {
+        trajectoriesRes = null;
+    }
+    if (trajectoriesRes) {
+        sourceUsed = 'local_rpc';
+        // Antigravity language_server returns: { trajectorySummaries: { [cascadeId: string]: TrajectorySummary } }
+        const summaries = trajectoriesRes.trajectorySummaries || {};
+        const cascadeIds = Object.keys(summaries);
+        if (cascadeIds.length > 0) {
+            for (const cascadeId of cascadeIds) {
+                try {
+                    const trajRes = await (0, lsRpcClient_1.getCascadeTrajectory)(sandboxRoot, cascadeId);
+                    const traj = trajRes?.trajectory || trajRes;
+                    if (!traj) {
+                        continue;
+                    }
+                    const generatorMeta = Array.isArray(traj.generatorMetadata) ? traj.generatorMetadata : [];
+                    for (let mIdx = 0; mIdx < generatorMeta.length; mIdx++) {
+                        const meta = generatorMeta[mIdx];
+                        const chatModel = meta.chatModel || {};
+                        const usage = chatModel.usage || {};
+                        const model = chatModel.model || usage.model || 'gemini-model';
+                        const inputTokens = parseInt(usage.inputTokens || '0', 10);
+                        const outputTokens = parseInt(usage.outputTokens || '0', 10);
+                        const cachedTokens = parseInt(usage.cachedTokens || '0', 10);
+                        const totalTokens = inputTokens + outputTokens;
+                        if (totalTokens > 0 || inputTokens > 0 || outputTokens > 0) {
+                            const stepIdx = meta.stepIndices?.[0] ?? mIdx;
+                            const stepCreatedAt = traj.steps?.[stepIdx]?.metadata?.createdAt || traj.lastModifiedTime;
+                            const ts = stepCreatedAt
+                                ? Math.floor(new Date(stepCreatedAt).getTime() / 1000)
+                                : Math.floor(Date.now() / 1000);
+                            const messageId = usage.messageId || `${mIdx}`;
+                            const stepKey = `${cascadeId}:${stepIdx}:${messageId}`;
+                            recordsToInsert.push({
+                                stepKey,
+                                timestamp: ts,
+                                accountEmail: currentAccountEmail,
+                                model,
+                                inputTokens,
+                                outputTokens,
+                                cachedTokens,
+                                totalTokens,
+                                requestedModel: chatModel.model || model,
+                            });
+                        }
+                    }
+                    // Fallback if generatorMetadata was absent but steps have tokenUsage
+                    if (generatorMeta.length === 0 && Array.isArray(traj.steps)) {
+                        for (let i = 0; i < traj.steps.length; i++) {
+                            const step = traj.steps[i];
+                            const usage = step.tokenUsage || step.usage || {};
+                            const inputTokens = Number(usage.promptTokens || usage.inputTokens || 0);
+                            const outputTokens = Number(usage.candidateTokens || usage.outputTokens || 0);
+                            const cachedTokens = Number(usage.cachedTokens || 0);
+                            const totalTokens = Number(usage.totalTokens || (inputTokens + outputTokens));
+                            if (totalTokens > 0 || inputTokens > 0 || outputTokens > 0) {
+                                const ts = step.metadata?.createdAt
+                                    ? Math.floor(new Date(step.metadata.createdAt).getTime() / 1000)
+                                    : Math.floor(Date.now() / 1000);
+                                const stepKey = `${cascadeId}:${step.stepIndex ?? i}:${step.plannerResponse?.messageId || i}`;
+                                recordsToInsert.push({
+                                    stepKey,
+                                    timestamp: ts,
+                                    accountEmail: currentAccountEmail,
+                                    model: step.model || 'gemini-model',
+                                    inputTokens,
+                                    outputTokens,
+                                    cachedTokens,
+                                    totalTokens,
+                                    requestedModel: step.requestedModel || step.model,
+                                });
+                            }
+                        }
+                    }
+                }
+                catch {
+                    // Skip unparseable trajectory
+                }
+            }
+        }
+        else if (Array.isArray(trajectoriesRes.trajectories || trajectoriesRes.cascadeTrajectories)) {
+            // Compatibility with classic array trajectory responses
+            const trajectories = trajectoriesRes.trajectories || trajectoriesRes.cascadeTrajectories;
+            for (const t of trajectories) {
+                const trajId = String(t.trajectoryId || t.id || '');
+                const steps = t.steps || t.trajectorySteps || [];
+                if (Array.isArray(steps)) {
+                    for (let i = 0; i < steps.length; i++) {
+                        const step = steps[i];
+                        const inputTokens = Number(step.tokenUsage?.promptTokens || step.inputTokens || 0);
+                        const outputTokens = Number(step.tokenUsage?.candidateTokens || step.outputTokens || 0);
+                        const cachedTokens = Number(step.tokenUsage?.cachedTokens || 0);
+                        const totalTokens = Number(step.tokenUsage?.totalTokens || (inputTokens + outputTokens));
+                        if (totalTokens > 0 || inputTokens > 0 || outputTokens > 0) {
+                            const ts = step.timestamp
+                                ? Math.floor(new Date(step.timestamp).getTime() / 1000)
+                                : Math.floor(Date.now() / 1000);
+                            const stepKey = `${trajId}:${step.stepIndex ?? i}`;
+                            recordsToInsert.push({
+                                stepKey,
+                                timestamp: ts,
+                                accountEmail: currentAccountEmail,
+                                model: step.model || 'gemini-model',
+                                inputTokens,
+                                outputTokens,
+                                cachedTokens,
+                                totalTokens,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let addedSteps = 0;
+    if (recordsToInsert.length > 0) {
+        addedSteps = await recordBatchUsage(sandboxRoot, recordsToInsert);
+    }
+    return { addedSteps, source: sourceUsed };
 }
 /**
  * Returns overall token stats KPI summary.

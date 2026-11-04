@@ -1,7 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
-import { execSync } from 'child_process';
 import { getSandboxPaths, getProfileSnapshotDir, getIsolatedProfileEnvDir } from './paths';
 import { assertInsideSandbox } from './sandboxEnv';
 import { extractAuthItemsFromDb, DbItem } from './sqliteInjector';
@@ -230,70 +229,6 @@ export function clearGeminiFileCredentials(sandboxHome: string, sandboxRoot: str
 }
 
 /**
- * Reads a generic credential from Windows Credential Manager via PowerShell / advapi32.
- * STRICTLY READ-ONLY: Used solely to capture newly authenticated tokens without mutating system state.
- */
-export function readWindowsCredential(target: string): string | null {
-  if (process.platform !== 'win32') {
-    return null;
-  }
-  try {
-    const psScript = `
-      Add-Type -TypeDefinition @"
-      using System;
-      using System.Runtime.InteropServices;
-      public class WinCred {
-          [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-          public struct CREDENTIAL {
-              public int Flags;
-              public int Type;
-              public string TargetName;
-              public string Comment;
-              public System.Runtime.InteropServices.ComTypes.FILETIME LastWritten;
-              public int CredentialBlobSize;
-              public IntPtr CredentialBlob;
-              public int Persist;
-              public int AttributeCount;
-              public IntPtr Attributes;
-              public string TargetAlias;
-              public string UserName;
-          }
-          [DllImport("advapi32.dll", EntryPoint = "CredReadW", CharSet = CharSet.Unicode, SetLastError = true)]
-          public static extern bool CredRead(string target, int type, int reservedFlag, out IntPtr credentialPtr);
-          [DllImport("advapi32.dll", EntryPoint = "CredFree", SetLastError = true)]
-          public static extern void CredFree(IntPtr cred);
-          public static string Read(string target) {
-              IntPtr credPtr;
-              if (CredRead(target, 1, 0, out credPtr)) {
-                  CREDENTIAL cred = (CREDENTIAL)Marshal.PtrToStructure(credPtr, typeof(CREDENTIAL));
-                  byte[] bytes = new byte[cred.CredentialBlobSize];
-                  Marshal.Copy(cred.CredentialBlob, bytes, 0, cred.CredentialBlobSize);
-                  CredFree(credPtr);
-                  return System.Text.Encoding.UTF8.GetString(bytes);
-              }
-              return null;
-          }
-      }
-"@
-      [WinCred]::Read('${target}')
-    `.replace(/\\r?\\n\\s*/g, ' ');
-
-    const output = execSync(
-      `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "${psScript}"`,
-      {
-        windowsHide: true,
-        encoding: 'utf-8',
-        timeout: 4000,
-      }
-    );
-    const trimmed = output.trim();
-    return trimmed || null;
-  } catch {
-    return null;
-  }
-}
-
-/**
  * Loads the switcher configuration (mode, activeProfile, globalProxyUrl).
  */
 export function loadConfig(sandboxRoot: string): SwitcherConfig {
@@ -503,28 +438,10 @@ export async function captureCurrentProfile(
 ): Promise<StoredProfile> {
   const paths = getSandboxPaths(sandboxRoot);
 
-  // 1. Read token: CLI token, or Gemini file credentials, or Windows Credential Manager fallback
+  // 1. Read token strictly from isolated sandbox files: CLI token or Gemini file credentials
   let cliToken = readCliToken(paths.cliTokenFile, sandboxRoot);
   if (!cliToken) {
     cliToken = readGeminiFileCredentials(paths.sandboxHome, sandboxRoot);
-  }
-  if (!cliToken && process.platform === 'win32') {
-    const credStr = readWindowsCredential('gemini:antigravity');
-    if (credStr) {
-      try {
-        const parsed = JSON.parse(credStr);
-        cliToken = {
-          access_token: parsed.token?.access_token || parsed.access_token,
-          refresh_token: parsed.token?.refresh_token || parsed.refresh_token,
-          id_token: parsed.token?.id_token || parsed.id_token,
-          id_token_email: parsed.id_token_email || parsed.email,
-          expiry_date: parsed.token?.expiry ? new Date(parsed.token.expiry).getTime() : undefined,
-          token_type: parsed.token?.token_type || 'Bearer',
-        };
-      } catch {
-        // Parse error
-      }
-    }
   }
 
   // 2. Resolve email automatically
