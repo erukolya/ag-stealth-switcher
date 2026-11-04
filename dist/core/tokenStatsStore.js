@@ -112,28 +112,15 @@ async function openTokenStatsDb(sandboxRoot) {
     catch {
         // Migration fallback failed non-fatally
     }
-    // 3. Purge synthetic records and backfill deterministic step_key for legacy records
+    // 3. Purge synthetic fallback records from v1 (strictly by synthetic model identifier 'gemini-active')
     try {
-        const nullCheck = db.exec('SELECT COUNT(*) FROM token_usage WHERE step_key IS NULL;');
-        const nullCount = nullCheck.length > 0 && nullCheck[0].values[0] ? Number(nullCheck[0].values[0][0]) : 0;
-        if (nullCount > 0 || ranMigration) {
+        const syntheticCheck = db.exec("SELECT COUNT(*) FROM token_usage WHERE model = 'gemini-active';");
+        const syntheticCount = syntheticCheck.length > 0 && syntheticCheck[0].values[0] ? Number(syntheticCheck[0].values[0][0]) : 0;
+        if (syntheticCount > 0) {
             ranMigration = true;
-            // 3a. Remove synthetic multiplier rows from earlier versions (e.g. 430/250/180 estimates)
-            db.run(`
-        DELETE FROM token_usage
-        WHERE step_key IS NULL
-          AND (
-            (input_tokens % 250 = 0 AND output_tokens % 180 = 0 AND total_tokens = (input_tokens + output_tokens) AND total_tokens > 0)
-            OR (input_tokens = 0 AND output_tokens = 0 AND total_tokens > 0)
-          );
-      `);
-            // 3b. Backfill remaining authentic legacy rows with unique deterministic step_keys
-            db.run(`
-        UPDATE token_usage
-        SET step_key = 'migrated_' || id || '_' || timestamp || '_' || model
-        WHERE step_key IS NULL;
-      `);
-            // 3c. Rebuild token_stats_hourly aggregates from clean token_usage to eliminate double-counted hourly totals
+            db.run("DELETE FROM token_usage WHERE model = 'gemini-active';");
+            db.run("DELETE FROM token_sync_cursor WHERE source_id = 'conv_summaries';");
+            // Rebuild token_stats_hourly aggregates from clean token_usage to eliminate purged synthetic totals
             db.run('DELETE FROM token_stats_hourly;');
             db.run(`
         INSERT OR REPLACE INTO token_stats_hourly (
@@ -248,6 +235,19 @@ async function recordBatchUsage(sandboxRoot, records) {
     const { db, save, close } = await openTokenStatsDb(sandboxRoot);
     let count = 0;
     try {
+        const claimLegacyStmt = db.prepare(`
+      UPDATE token_usage
+      SET step_key = ?
+      WHERE id = (
+        SELECT id FROM token_usage
+        WHERE step_key IS NULL
+          AND model = ?
+          AND timestamp BETWEEN ? AND ?
+          AND input_tokens = ?
+          AND output_tokens = ?
+        LIMIT 1
+      );
+    `);
         const insertUsageStmt = db.prepare(`
       INSERT INTO token_usage (
         step_key, timestamp, account_email, model,
@@ -272,6 +272,23 @@ async function recordBatchUsage(sandboxRoot, records) {
         for (const r of records) {
             const total = r.totalTokens || (r.inputTokens + r.outputTokens);
             const stepKey = r.stepKey || `${r.timestamp}_${r.model}_${r.inputTokens}_${r.outputTokens}_${Math.random()}`;
+            // 1. First attempt to match and claim an existing unkeyed legacy row
+            claimLegacyStmt.run([
+                stepKey,
+                r.model,
+                r.timestamp - 5,
+                r.timestamp + 5,
+                r.inputTokens,
+                r.outputTokens,
+            ]);
+            const claimedCount = db.getRowsModified();
+            if (claimedCount > 0) {
+                // The legacy row was claimed and updated in-place with its authentic stepKey.
+                // It was already counted in token_stats_hourly when created, so do NOT increment hourly again!
+                count++;
+                continue;
+            }
+            // 2. If not a legacy match, perform idempotent insert
             insertUsageStmt.run([
                 stepKey,
                 r.timestamp,
@@ -303,6 +320,7 @@ async function recordBatchUsage(sandboxRoot, records) {
                 ]);
             }
         }
+        claimLegacyStmt.free();
         insertUsageStmt.free();
         updateHourlyStmt.free();
         if (count > 0) {

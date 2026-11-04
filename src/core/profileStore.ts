@@ -431,8 +431,10 @@ export function buildQuotaSnapshot(status: UserStatusResult | null): ProfileQuot
 }
 
 export interface ActiveSessionContext {
-  mode: SwitcherMode;
-  account?: string;
+  mode: SwitcherMode;           // Physical runtime mode of current running process ('in-place' | 'isolated-dir')
+  configuredMode: SwitcherMode; // Configured mode for NEXT switch/launch in config.json
+  instanceId?: string;          // Directory folder identifier (e.g. 'blank_1730752000' or 'user_gmail_com')
+  account?: string;             // Resolved account email (never blank_*)
   userDataDir: string;
   userHome: string;
   stateVscdb: string;
@@ -445,8 +447,8 @@ export type ActiveSessionPaths = ActiveSessionContext;
 
 /**
  * Resolves the real unified context of the currently executing IDE session.
- * In isolated-dir mode, retrieves paths and account identity from active folder / environment.
- * Ensures that credentials and database states are strictly isolated without leaking between accounts.
+ * The paths are strictly determined by the physical runtime environment of the active process
+ * (process.argv and process.env), and are never altered by toggling config.mode while running.
  */
 export function getActiveSessionContext(sandboxRoot: string, emailHint?: string): ActiveSessionContext {
   const defaultPaths = getSandboxPaths(sandboxRoot);
@@ -454,9 +456,8 @@ export function getActiveSessionContext(sandboxRoot: string, emailHint?: string)
 
   let activeUserData = defaultPaths.userDataDir;
   let activeHome = defaultPaths.sandboxHome;
-  let detectedAccount = emailHint;
 
-  // 1. Scan command-line arguments for explicit --user-data-dir
+  // 1. Scan command-line arguments for explicit --user-data-dir of CURRENT process
   if (Array.isArray(process.argv)) {
     for (let i = 0; i < process.argv.length; i++) {
       const arg = process.argv[i];
@@ -468,7 +469,7 @@ export function getActiveSessionContext(sandboxRoot: string, emailHint?: string)
     }
   }
 
-  // 2. Check process.env.USERPROFILE / HOME if inside sandbox root
+  // 2. Check process.env.USERPROFILE / HOME of CURRENT process
   const envHome = process.env.USERPROFILE || process.env.HOME;
   if (
     envHome &&
@@ -478,8 +479,15 @@ export function getActiveSessionContext(sandboxRoot: string, emailHint?: string)
     activeHome = path.resolve(envHome);
   }
 
-  // 3. Detect account name from isolated path if running inside isolated_envs
-  if (!detectedAccount) {
+  // 3. Determine if the CURRENT running process is running in an isolated directory
+  const isIsolatedDir =
+    activeUserData.includes('isolated_envs') ||
+    activeHome.includes('isolated_envs');
+
+  let instanceId: string | undefined = undefined;
+  let detectedAccount: string | undefined = undefined;
+
+  if (isIsolatedDir) {
     const isolatedMarker = `${path.sep}isolated_envs${path.sep}`;
     const searchTarget = activeUserData.includes('isolated_envs') ? activeUserData : activeHome;
     const idx = searchTarget.indexOf(isolatedMarker);
@@ -487,31 +495,26 @@ export function getActiveSessionContext(sandboxRoot: string, emailHint?: string)
       const remainder = searchTarget.slice(idx + isolatedMarker.length);
       const parts = remainder.split(path.sep);
       if (parts.length > 0 && parts[0]) {
-        detectedAccount = parts[0];
+        instanceId = parts[0];
+        // If instanceId is NOT a temporary blank folder, it may be an email hint
+        if (!instanceId.startsWith('blank_') && instanceId !== 'blank') {
+          detectedAccount = emailHint || instanceId;
+        }
       }
     }
-  }
-
-  // 4. Resolve isolated-dir paths if running in isolated mode
-  const targetEmail = detectedAccount || emailHint || config.activeProfile;
-  const isIsolatedMode =
-    config.mode === 'isolated-dir' ||
-    activeUserData.includes('isolated_envs') ||
-    activeHome.includes('isolated_envs');
-
-  if (isIsolatedMode && targetEmail) {
-    const isolated = prepareIsolatedDir(sandboxRoot, targetEmail);
-    if (fs.existsSync(isolated.userData) || activeUserData.includes('isolated_envs')) {
-      activeUserData = isolated.userData;
+  } else {
+    // In in-place mode, emailHint or config.activeProfile can be an account hint if not blank
+    if (emailHint && !emailHint.startsWith('blank_')) {
+      detectedAccount = emailHint;
+    } else if (config.activeProfile && !config.activeProfile.startsWith('blank_')) {
+      detectedAccount = config.activeProfile;
     }
-    if (fs.existsSync(isolated.userHome) || activeHome.includes('isolated_envs')) {
-      activeHome = isolated.userHome;
-    }
-    detectedAccount = targetEmail;
   }
 
   return {
-    mode: isIsolatedMode ? 'isolated-dir' : 'in-place',
+    mode: isIsolatedDir ? 'isolated-dir' : 'in-place',
+    configuredMode: config.mode,
+    instanceId,
     account: detectedAccount,
     userDataDir: activeUserData,
     userHome: activeHome,
@@ -540,7 +543,7 @@ export async function captureCurrentProfile(
   if (!cliToken) {
     cliToken = readGeminiFileCredentials(session.geminiHome, sandboxRoot);
   }
-  // Fallback to default paths ONLY if in clean-env mode (never mix credentials in isolated-dir mode)
+  // Fallback to default paths ONLY if the current process is running in in-place mode
   if (!cliToken && session.mode !== 'isolated-dir') {
     const defaultPaths = getSandboxPaths(sandboxRoot);
     cliToken = readCliToken(defaultPaths.cliTokenFile, sandboxRoot);
@@ -549,26 +552,38 @@ export async function captureCurrentProfile(
     }
   }
 
-  // 2. Resolve email automatically from token, RPC, or session context
-  let email = emailOverride;
-  if (!email && cliToken && cliToken.id_token_email) {
+  // 2. Resolve email strictly: token / RPC / non-blank account
+  // If emailOverride was provided but is a blank_* ID, ignore it
+  let email = emailOverride && !emailOverride.startsWith('blank_') ? emailOverride : undefined;
+
+  // Real OAuth token email has priority 1
+  if (!email && cliToken && cliToken.id_token_email && !cliToken.id_token_email.startsWith('blank_')) {
     email = cliToken.id_token_email;
   }
 
+  // Local Language Server RPC email has priority 2
   if (!email) {
     const userStatus = await getLocalUserStatus(sandboxRoot);
-    if (userStatus && userStatus.email) {
+    if (userStatus && userStatus.email && !userStatus.email.startsWith('blank_')) {
       email = userStatus.email;
     }
   }
 
-  if (!email && session.account) {
+  // Non-blank session account has priority 3
+  if (!email && session.account && !session.account.startsWith('blank_')) {
     email = session.account;
   }
 
+  // If still not resolved, check config.activeProfile if valid
   if (!email) {
     const config = loadConfig(sandboxRoot);
-    email = config.activeProfile || `account_${Date.now()}@sandbox`;
+    if (config.activeProfile && !config.activeProfile.startsWith('blank_')) {
+      email = config.activeProfile;
+    }
+  }
+
+  if (!email) {
+    throw new Error('Cannot determine user email for active session. Please log in or specify an email.');
   }
 
   // 3. Extract database auth rows from active session's state.vscdb

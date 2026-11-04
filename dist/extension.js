@@ -255,17 +255,25 @@ async function handleCaptureCurrentAccount(sandboxRoot) {
         if (!cliToken) {
             cliToken = (0, profileStore_1.readGeminiFileCredentials)(session.geminiHome, sandboxRoot);
         }
-        let detectedEmail = session.account || cliToken?.id_token_email;
+        // Priority 1: Authentic email from active session token
+        let detectedEmail = cliToken?.id_token_email && !cliToken.id_token_email.startsWith('blank_')
+            ? cliToken.id_token_email
+            : undefined;
+        // Priority 2: Authentic email from local Language Server RPC
         if (!detectedEmail) {
             try {
                 const userStatus = await (0, lsRpcClient_1.getLocalUserStatus)(sandboxRoot);
-                if (userStatus?.email) {
+                if (userStatus?.email && !userStatus.email.startsWith('blank_')) {
                     detectedEmail = userStatus.email;
                 }
             }
             catch {
                 // Fallback
             }
+        }
+        // Priority 3: Non-blank session account
+        if (!detectedEmail && session.account && !session.account.startsWith('blank_')) {
+            detectedEmail = session.account;
         }
         let email = detectedEmail;
         if (!email) {

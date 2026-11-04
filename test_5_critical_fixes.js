@@ -9,6 +9,7 @@ const {
   writeCliToken,
   writeGeminiFileCredentials,
   saveConfig,
+  loadConfig,
   getProfile,
 } = require('./dist/core/profileStore');
 const {
@@ -34,12 +35,12 @@ function cleanDir(dir) {
 }
 
 async function runTests() {
-  console.log('=== RUNNING VERIFICATION FOR 5 REMAINING AUDIT FIXES ===\n');
+  console.log('=== RUNNING VERIFICATION FOR ALL AUDIT FIXES ===\n');
   cleanDir(TEST_ROOT);
   fs.mkdirSync(TEST_ROOT, { recursive: true });
 
   // -------------------------------------------------------------
-  // TEST 1: isolated-dir account isolation & unified session context
+  // TEST 1: isolated-dir account isolation & non-overwriting
   // -------------------------------------------------------------
   console.log('[Test 1] Verifying isolated-dir account context & non-overwriting...');
   {
@@ -73,7 +74,7 @@ async function runTests() {
 
     const ctx = getActiveSessionContext(TEST_ROOT);
     assert.strictEqual(ctx.mode, 'isolated-dir', 'Context mode must be isolated-dir');
-    assert.strictEqual(ctx.account, 'accountB_gmail_com', 'Detected account must be accountB');
+    assert.strictEqual(ctx.instanceId, 'accountB_gmail_com', 'Instance ID must be accountB_gmail_com');
     assert.strictEqual(ctx.userHome, isolatedBHome, 'UserHome must point to isolated instance home');
 
     // Capture current profile
@@ -95,9 +96,87 @@ async function runTests() {
   }
 
   // -------------------------------------------------------------
-  // TEST 2: Reading profile items from live uncheckpointed WAL
+  // TEST 2: Toggle Mode does NOT change running process session paths
   // -------------------------------------------------------------
-  console.log('\n[Test 2] Verifying extraction of live WAL frames via MVCC...');
+  console.log('\n[Test 2] Verifying Toggle Mode does NOT alter running process session paths...');
+  {
+    // Start running in in-place mode (default SandboxHome and data/user-data)
+    saveConfig(TEST_ROOT, {
+      mode: 'in-place',
+      activeProfile: 'inplace_user@example.com',
+    });
+
+    const origUserProfile = process.env.USERPROFILE;
+    const defaultHome = path.join(TEST_ROOT, 'SandboxHome');
+    process.env.USERPROFILE = defaultHome;
+
+    // Check initial context
+    const ctxBefore = getActiveSessionContext(TEST_ROOT);
+    assert.strictEqual(ctxBefore.mode, 'in-place', 'Initially running mode is in-place');
+    assert.strictEqual(ctxBefore.userHome, defaultHome, 'User home is SandboxHome');
+
+    // User toggles mode in UI to 'isolated-dir'
+    const cfg = loadConfig(TEST_ROOT);
+    cfg.mode = 'isolated-dir';
+    saveConfig(TEST_ROOT, cfg);
+
+    // Re-check active session context while IDE is STILL RUNNING with original process env
+    const ctxAfter = getActiveSessionContext(TEST_ROOT);
+    assert.strictEqual(ctxAfter.mode, 'in-place', 'Running mode MUST remain in-place (immutable during process lifecycle)');
+    assert.strictEqual(ctxAfter.configuredMode, 'isolated-dir', 'Configured mode for NEXT launch is isolated-dir');
+    assert.strictEqual(ctxAfter.userHome, defaultHome, 'User home MUST remain SandboxHome without creating isolated dir');
+
+    // Restore env
+    if (origUserProfile) {
+      process.env.USERPROFILE = origUserProfile;
+    } else {
+      delete process.env.USERPROFILE;
+    }
+    console.log('  -> PASS: Toggle Mode applies only to next launch; running session paths remain immutable.');
+  }
+
+  // -------------------------------------------------------------
+  // TEST 3: Blank Profile separation of instanceId and account email
+  // -------------------------------------------------------------
+  console.log('\n[Test 3] Verifying Blank Profile directory ID (blank_*) is not taken for account email...');
+  {
+    const blankId = `blank_${Date.now()}`;
+    const blankHome = path.join(TEST_ROOT, 'SandboxHome', '.ag-stealth-switcher', 'isolated_envs', blankId, 'home');
+    const blankCli = path.join(blankHome, '.antigravity-cli');
+    fs.mkdirSync(blankCli, { recursive: true });
+
+    // Simulate user logs in through browser, Antigravity writes real token
+    const realEmail = 'alice.developer@gmail.com';
+    fs.writeFileSync(
+      path.join(blankCli, 'oauth_token.json'),
+      JSON.stringify({ id_token_email: realEmail, access_token: 'alice_live_token' })
+    );
+
+    const origUserProfile = process.env.USERPROFILE;
+    process.env.USERPROFILE = blankHome;
+
+    const ctx = getActiveSessionContext(TEST_ROOT);
+    assert.strictEqual(ctx.instanceId, blankId, 'instanceId must be the blank directory folder name');
+    assert.strictEqual(ctx.account, undefined, 'account must NOT be blank_*');
+
+    // Capture profile without emailOverride
+    const profile = await captureCurrentProfile(TEST_ROOT);
+    assert.strictEqual(profile.email, realEmail, 'Profile email must be alice.developer@gmail.com, NOT blank_*');
+    assert.strictEqual(profile.cliToken.id_token_email, realEmail);
+
+    // Restore env
+    if (origUserProfile) {
+      process.env.USERPROFILE = origUserProfile;
+    } else {
+      delete process.env.USERPROFILE;
+    }
+    console.log('  -> PASS: Blank profile directory name is properly separated from authentic user email.');
+  }
+
+  // -------------------------------------------------------------
+  // TEST 4: Reading profile items from live uncheckpointed WAL
+  // -------------------------------------------------------------
+  console.log('\n[Test 4] Verifying extraction of live WAL frames via MVCC...');
   {
     const dbDir = path.join(TEST_ROOT, 'data', 'user-data', 'User', 'globalStorage');
     fs.mkdirSync(dbDir, { recursive: true });
@@ -128,9 +207,9 @@ async function runTests() {
   }
 
   // -------------------------------------------------------------
-  // TEST 3: Strict targeted database cleaning (no wiping other secrets)
+  // TEST 5: Strict targeted auth cleaning (preserving third-party secrets)
   // -------------------------------------------------------------
-  console.log('\n[Test 3] Verifying strict targeted auth cleaning (preserving third-party secrets)...');
+  console.log('\n[Test 5] Verifying strict targeted auth cleaning (preserving third-party secrets)...');
   {
     const dbDir = path.join(TEST_ROOT, 'data', 'user-data', 'User', 'globalStorage');
     const dbPath = path.join(dbDir, 'state.vscdb');
@@ -165,9 +244,9 @@ async function runTests() {
   }
 
   // -------------------------------------------------------------
-  // TEST 4: Authentic token lifetime (no fake Date.now() + 1h synthesis)
+  // TEST 6: Authentic token lifetime (no fake Date.now() + 1h synthesis)
   // -------------------------------------------------------------
-  console.log('\n[Test 4] Verifying token lifetime preservation...');
+  console.log('\n[Test 6] Verifying token lifetime preservation...');
   {
     const userHome = path.join(TEST_ROOT, 'SandboxHome');
     const authenticExpiry = 1600000000000; // Past expired timestamp
@@ -204,9 +283,9 @@ async function runTests() {
   }
 
   // -------------------------------------------------------------
-  // TEST 5: Statistics migration (purging synthetic & deduplicating)
+  // TEST 7: Accurate Statistics Migration & Seamless Deduplication
   // -------------------------------------------------------------
-  console.log('\n[Test 5] Verifying statistics migration & duplicate prevention...');
+  console.log('\n[Test 7] Verifying statistics migration (no modulo deletion flaw, seamless legacy claiming)...');
   {
     const statsDbPath = path.join(TEST_ROOT, 'SandboxHome', '.ag-stealth-switcher', 'token_stats.db');
     fs.mkdirSync(path.dirname(statsDbPath), { recursive: true });
@@ -226,60 +305,68 @@ async function runTests() {
         requested_model TEXT,
         ttft_ms INTEGER
       );
-      -- Insert synthetic multiplier row from v1 (250 / 180 / 430)
-      INSERT INTO token_usage VALUES (1, 1700000000, 'legacy@example.com', 'gemini-pro', 250, 180, 0, 430, 'gemini', 100);
-      -- Insert authentic legacy row
-      INSERT INTO token_usage VALUES (2, 1700000010, 'legacy@example.com', 'gemini-pro', 345, 678, 50, 1073, 'gemini', 150);
+      -- 1. Real request that happened to have 500 input and 180 output tokens (must NOT be purged!)
+      INSERT INTO token_usage VALUES (1, 1700000000, 'legacy@example.com', 'gemini-1.5-pro', 500, 180, 0, 680, 'gemini-1.5-pro', 100);
+      -- 2. Synthetic multiplier row from v1 (identified strictly by model = 'gemini-active')
+      INSERT INTO token_usage VALUES (2, 1700000010, 'legacy@example.com', 'gemini-active', 250, 180, 0, 430, 'gemini', 150);
+      -- 3. Another authentic legacy request
+      INSERT INTO token_usage VALUES (3, 1700000020, 'legacy@example.com', 'gemini-2.0-flash', 150, 250, 50, 400, 'gemini-2.0-flash', 120);
     `);
     sdb.close();
 
-    // Open via openTokenStatsDb: triggers migration
+    // Open via openTokenStatsDb: triggers deterministic migration
     const { db, close } = await openTokenStatsDb(TEST_ROOT);
     close();
 
     // Verify migration results
     const checkDb = new DatabaseSync(statsDbPath, { readOnly: true });
-    const rows = checkDb.prepare('SELECT id, step_key, total_tokens FROM token_usage').all();
+    const rows = checkDb.prepare('SELECT id, model, total_tokens, step_key FROM token_usage ORDER BY id').all();
     checkDb.close();
 
-    assert.strictEqual(rows.length, 1, 'Synthetic row must be purged; exactly 1 authentic row remains');
-    assert.strictEqual(rows[0].id, 2, 'Authentic row #2 must be preserved');
-    assert.ok(rows[0].step_key && rows[0].step_key.startsWith('migrated_2_'), 'Authentic row must have deterministic step_key');
+    // Row 2 ('gemini-active') must be purged
+    // Row 1 (500/180) and Row 3 must be preserved!
+    assert.strictEqual(rows.length, 2, 'Exactly 2 authentic rows must remain; gemini-active purged');
+    assert.strictEqual(rows[0].id, 1, 'Authentic row 1 (500/180) must be preserved without false-positive purge');
+    assert.strictEqual(rows[0].model, 'gemini-1.5-pro');
+    assert.strictEqual(rows[0].total_tokens, 680);
+    assert.strictEqual(rows[0].step_key, null, 'Legacy rows remain unkeyed until claimed by authentic sync');
 
-    // Test recordBatchUsage with new unique step keys: ensure no double counting
+    assert.strictEqual(rows[1].id, 3, 'Authentic row 3 must be preserved');
+    assert.strictEqual(rows[1].model, 'gemini-2.0-flash');
+
+    // Simulate Language Server RPC trajectory sync: re-imports row 1 with authentic step_key
     await recordBatchUsage(TEST_ROOT, [
       {
-        stepKey: 'step_real_1',
-        timestamp: 1700000020,
+        stepKey: 'cascade_real_traj_1:0:msg_1',
+        timestamp: 1700000000,
         accountEmail: 'legacy@example.com',
-        model: 'gemini-pro',
-        inputTokens: 100,
-        outputTokens: 200,
+        model: 'gemini-1.5-pro',
+        inputTokens: 500,
+        outputTokens: 180,
         cachedTokens: 0,
-        totalTokens: 300,
-      },
-      // Re-insert same step: must deduplicate and not increase total
-      {
-        stepKey: 'step_real_1',
-        timestamp: 1700000020,
-        accountEmail: 'legacy@example.com',
-        model: 'gemini-pro',
-        inputTokens: 100,
-        outputTokens: 200,
-        cachedTokens: 0,
-        totalTokens: 300,
+        totalTokens: 680,
       },
     ]);
 
-    const summary = await getStatsSummary(TEST_ROOT);
-    // Total tokens should be: 1073 (migrated authentic row) + 300 (step_real_1 once) = 1373
-    assert.strictEqual(summary.totalTokens, 1373, 'Total tokens must equal 1373 with zero duplication');
+    // Inspect database after sync
+    const checkDb2 = new DatabaseSync(statsDbPath, { readOnly: true });
+    const rowsAfterSync = checkDb2.prepare('SELECT id, model, total_tokens, step_key FROM token_usage ORDER BY id').all();
+    checkDb2.close();
 
-    console.log('  -> PASS: Statistics migration purges synthetic rows and deduplicates flawlessly.');
+    // Row 1 should have been claimed in-place with its authentic stepKey!
+    assert.strictEqual(rowsAfterSync.length, 2, 'No new row inserted! Legacy row was claimed in-place');
+    assert.strictEqual(rowsAfterSync[0].id, 1);
+    assert.strictEqual(rowsAfterSync[0].step_key, 'cascade_real_traj_1:0:msg_1', 'Authentic stepKey successfully claimed');
+
+    // Check summary totals: 680 + 400 = 1080 (zero double counting!)
+    const summary = await getStatsSummary(TEST_ROOT);
+    assert.strictEqual(summary.totalTokens, 1080, 'Total tokens must equal 1080 with zero double counting');
+
+    console.log('  -> PASS: Statistics migration purges only synthetic records and claims legacy rows without double counting.');
   }
 
   cleanDir(TEST_ROOT);
-  console.log('\n=== ALL 5 AUDIT VERIFICATION TESTS PASSED SUCCESSFULLY! ===');
+  console.log('\n=== ALL AUDIT VERIFICATION TESTS PASSED SUCCESSFULLY! ===');
 }
 
 runTests().catch((err) => {

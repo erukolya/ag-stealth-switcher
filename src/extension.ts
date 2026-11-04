@@ -291,17 +291,27 @@ async function handleCaptureCurrentAccount(sandboxRoot: string): Promise<void> {
       cliToken = readGeminiFileCredentials(session.geminiHome, sandboxRoot);
     }
 
-    let detectedEmail: string | undefined = session.account || cliToken?.id_token_email;
+    // Priority 1: Authentic email from active session token
+    let detectedEmail: string | undefined =
+      cliToken?.id_token_email && !cliToken.id_token_email.startsWith('blank_')
+        ? cliToken.id_token_email
+        : undefined;
 
+    // Priority 2: Authentic email from local Language Server RPC
     if (!detectedEmail) {
       try {
         const userStatus = await getLocalUserStatus(sandboxRoot);
-        if (userStatus?.email) {
+        if (userStatus?.email && !userStatus.email.startsWith('blank_')) {
           detectedEmail = userStatus.email;
         }
       } catch {
         // Fallback
       }
+    }
+
+    // Priority 3: Non-blank session account
+    if (!detectedEmail && session.account && !session.account.startsWith('blank_')) {
+      detectedEmail = session.account;
     }
 
     let email = detectedEmail;
