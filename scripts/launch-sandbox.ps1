@@ -81,6 +81,7 @@ if (Test-Path $ConfigFile) {
 
 # 3. Configure Strict Process-Level Isolation
 $env:AG_SANDBOX_ROOT = $ResolvedSandbox
+$env:AG_STEALTH_USER_DATA_DIR = $EffectiveUserData
 $env:USERPROFILE = $EffectiveHome
 $env:HOME = $EffectiveHome
 $env:APPDATA = Join-Path $EffectiveHome "AppData\Roaming"

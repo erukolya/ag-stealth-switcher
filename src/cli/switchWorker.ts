@@ -207,6 +207,10 @@ async function main(): Promise<void> {
         logWorker(sandboxRoot, `Error: Profile ${target} not found in store!`);
         throw new Error(`Profile ${target} not found`);
       }
+      if (!profile.cliToken && (!profile.dbItems || profile.dbItems.length === 0)) {
+        logWorker(sandboxRoot, `Error: Profile ${target} has no credentials or database items. Aborting switch.`);
+        process.exit(1);
+      }
 
       logWorker(sandboxRoot, `Injecting credentials and telemetry for: ${profile.email}`);
       await injectAuthItemsIntoDb(paths.stateVscdb, profile.dbItems, sandboxRoot, profile.telemetry.devDeviceId);
@@ -216,6 +220,12 @@ async function main(): Promise<void> {
       if (profile.cliToken) {
         writeCliToken(paths.cliTokenFile, profile.cliToken, profile.email, sandboxRoot);
         writeGeminiFileCredentials(paths.sandboxHome, profile.email, profile.cliToken, sandboxRoot);
+      } else {
+        // Explicitly clear lingering CLI & Gemini file credentials from previous account
+        if (fs.existsSync(paths.cliTokenFile)) {
+          try { fs.unlinkSync(paths.cliTokenFile); } catch {}
+        }
+        clearGeminiFileCredentials(paths.sandboxHome, sandboxRoot);
       }
 
       const config = loadConfig(sandboxRoot);
@@ -257,17 +267,30 @@ async function main(): Promise<void> {
       saveConfig(sandboxRoot, config);
     } else {
       const profile = getProfile(sandboxRoot, target);
-      if (profile) {
-        logWorker(sandboxRoot, `Populating isolated directory for: ${profile.email}`);
-        await injectAuthItemsIntoDb(isolatedVscdb, profile.dbItems, sandboxRoot, profile.telemetry.devDeviceId);
-        safeCheckpointAndConsolidateWal(isolatedVscdb, sandboxRoot);
-        writeTelemetry(isolatedStorageJson, profile.telemetry, sandboxRoot);
+      if (!profile) {
+        logWorker(sandboxRoot, `Error: Profile ${target} not found in store!`);
+        process.exit(1);
+      }
+      if (!profile.cliToken && (!profile.dbItems || profile.dbItems.length === 0)) {
+        logWorker(sandboxRoot, `Error: Profile ${target} has no credentials or database items. Aborting switch.`);
+        process.exit(1);
+      }
 
-        const isolatedCliToken = path.join(userHome, '.antigravity-cli', 'oauth_token.json');
-        if (profile.cliToken) {
-          writeCliToken(isolatedCliToken, profile.cliToken, profile.email, sandboxRoot);
-          writeGeminiFileCredentials(userHome, profile.email, profile.cliToken, sandboxRoot);
+      logWorker(sandboxRoot, `Populating isolated directory for: ${profile.email}`);
+      await injectAuthItemsIntoDb(isolatedVscdb, profile.dbItems, sandboxRoot, profile.telemetry.devDeviceId);
+      safeCheckpointAndConsolidateWal(isolatedVscdb, sandboxRoot);
+      writeTelemetry(isolatedStorageJson, profile.telemetry, sandboxRoot);
+
+      const isolatedCliToken = path.join(userHome, '.antigravity-cli', 'oauth_token.json');
+      if (profile.cliToken) {
+        writeCliToken(isolatedCliToken, profile.cliToken, profile.email, sandboxRoot);
+        writeGeminiFileCredentials(userHome, profile.email, profile.cliToken, sandboxRoot);
+      } else {
+        // Explicitly clear lingering CLI & Gemini file credentials from previous account
+        if (fs.existsSync(isolatedCliToken)) {
+          try { fs.unlinkSync(isolatedCliToken); } catch {}
         }
+        clearGeminiFileCredentials(userHome, sandboxRoot);
       }
 
       const config = loadConfig(sandboxRoot);
@@ -291,7 +314,8 @@ async function main(): Promise<void> {
     logWorker(sandboxRoot, `Setting isolated outbound proxy: ${effectiveProxyUrl} with NO_PROXY`);
   }
 
-  const spawnEnv = getIsolatedEnv(sandboxRoot, launchHomeDir, effectiveProxyUrl);
+  const spawnEnv = getIsolatedEnv(sandboxRoot, launchHomeDir, effectiveProxyUrl, launchUserDataDir);
+  spawnEnv.AG_STEALTH_USER_DATA_DIR = launchUserDataDir;
   // Crucial Electron fix: Strip ELECTRON_RUN_AS_NODE so the launched IDE starts as a full GUI application
   delete spawnEnv.ELECTRON_RUN_AS_NODE;
   delete spawnEnv['ELECTRON_RUN_AS_NODE'];

@@ -44,6 +44,7 @@ fi
 
 # Export strictly isolated environment
 export AG_SANDBOX_ROOT="$RESOLVED_SANDBOX"
+export AG_STEALTH_USER_DATA_DIR="$EFFECTIVE_USER_DATA"
 export USERPROFILE="$EFFECTIVE_HOME"
 export HOME="$EFFECTIVE_HOME"
 export XDG_CONFIG_HOME="$EFFECTIVE_HOME/.config"

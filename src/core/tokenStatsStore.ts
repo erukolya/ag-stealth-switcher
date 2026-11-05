@@ -126,8 +126,19 @@ export async function openTokenStatsDb(
     // Migration fallback failed non-fatally
   }
 
-  // 3. Purge synthetic fallback records from v1 (strictly by synthetic model identifier 'gemini-active')
+  // 3. Automated migration for legacy records
   try {
+    // 3a. Revert synthetic migrated_* keys from commit a1180db back to NULL
+    // so incoming trajectory steps can properly claim them with authentic keys
+    const migratedCheck = db.exec("SELECT COUNT(*) FROM token_usage WHERE step_key LIKE 'migrated_%';");
+    const migratedCount =
+      migratedCheck.length > 0 && migratedCheck[0].values[0] ? Number(migratedCheck[0].values[0][0]) : 0;
+    if (migratedCount > 0) {
+      ranMigration = true;
+      db.run("UPDATE token_usage SET step_key = NULL WHERE step_key LIKE 'migrated_%';");
+    }
+
+    // 3b. Purge synthetic fallback records from v1 (strictly by synthetic model identifier 'gemini-active')
     const syntheticCheck = db.exec("SELECT COUNT(*) FROM token_usage WHERE model = 'gemini-active';");
     const syntheticCount =
       syntheticCheck.length > 0 && syntheticCheck[0].values[0] ? Number(syntheticCheck[0].values[0][0]) : 0;
@@ -261,12 +272,27 @@ export async function recordBatchUsage(
   let count = 0;
 
   try {
+    const checkStepExistsStmt = db.prepare('SELECT id FROM token_usage WHERE step_key = ?;');
+
+    const delDuplicateLegacyStmt = db.prepare(`
+      DELETE FROM token_usage
+      WHERE id = (
+        SELECT id FROM token_usage
+        WHERE (step_key IS NULL OR step_key LIKE 'migrated_%')
+          AND model = ?
+          AND timestamp BETWEEN ? AND ?
+          AND input_tokens = ?
+          AND output_tokens = ?
+        LIMIT 1
+      );
+    `);
+
     const claimLegacyStmt = db.prepare(`
-      UPDATE token_usage
+      UPDATE OR IGNORE token_usage
       SET step_key = ?
       WHERE id = (
         SELECT id FROM token_usage
-        WHERE step_key IS NULL
+        WHERE (step_key IS NULL OR step_key LIKE 'migrated_%')
           AND model = ?
           AND timestamp BETWEEN ? AND ?
           AND input_tokens = ?
@@ -303,7 +329,25 @@ export async function recordBatchUsage(
       const stepKey =
         r.stepKey || `${r.timestamp}_${r.model}_${r.inputTokens}_${r.outputTokens}_${Math.random()}`;
 
-      // 1. First attempt to match and claim an existing unkeyed legacy row
+      // 1. Check if this stepKey is ALREADY in token_usage
+      checkStepExistsStmt.bind([stepKey]);
+      const stepAlreadyExists = checkStepExistsStmt.step();
+      checkStepExistsStmt.reset();
+
+      if (stepAlreadyExists) {
+        // Step was already recorded earlier.
+        // Clean any redundant legacy unkeyed duplicate that matches this exact step
+        delDuplicateLegacyStmt.run([
+          r.model,
+          r.timestamp - 5,
+          r.timestamp + 5,
+          r.inputTokens,
+          r.outputTokens,
+        ]);
+        continue;
+      }
+
+      // 2. StepKey does not exist yet. Try claiming a matching unkeyed legacy row
       claimLegacyStmt.run([
         stepKey,
         r.model,
@@ -321,7 +365,7 @@ export async function recordBatchUsage(
         continue;
       }
 
-      // 2. If not a legacy match, perform idempotent insert
+      // 3. Normal idempotent insert
       insertUsageStmt.run([
         stepKey,
         r.timestamp,
@@ -356,6 +400,8 @@ export async function recordBatchUsage(
       }
     }
 
+    checkStepExistsStmt.free();
+    delDuplicateLegacyStmt.free();
     claimLegacyStmt.free();
     insertUsageStmt.free();
     updateHourlyStmt.free();

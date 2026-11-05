@@ -194,13 +194,25 @@ function assertInsideSandbox(targetPath, sandboxRoot, op = 'write') {
  * Replaces USERPROFILE, HOME, APPDATA, LOCALAPPDATA with SandboxHome paths.
  * If proxyUrl is provided, sets outbound proxy while STRICTLY protecting loopback (127.0.0.1) via NO_PROXY (Argon Fix #2).
  */
-function getIsolatedEnv(sandboxRoot, customHome, proxyUrl) {
+function getIsolatedEnv(sandboxRoot, customHome, proxyUrl, customUserData) {
     const paths = (0, paths_1.getSandboxPaths)(sandboxRoot);
     const homePath = customHome ? path.resolve(customHome) : paths.sandboxHome;
     assertInsideSandbox(homePath, sandboxRoot);
+    // Determine effective user-data directory for the child process environment
+    let effectiveUserData = customUserData ? path.resolve(customUserData) : undefined;
+    if (!effectiveUserData) {
+        if (homePath.includes('isolated_envs')) {
+            const deduced = path.join(path.dirname(homePath), 'user-data');
+            effectiveUserData = fs.existsSync(deduced) ? deduced : paths.userDataDir;
+        }
+        else {
+            effectiveUserData = paths.userDataDir;
+        }
+    }
     const env = {
         ...process.env,
         AG_SANDBOX_ROOT: paths.sandboxRoot,
+        AG_STEALTH_USER_DATA_DIR: effectiveUserData,
         USERPROFILE: homePath,
         HOME: homePath,
         APPDATA: path.join(homePath, 'AppData', 'Roaming'),

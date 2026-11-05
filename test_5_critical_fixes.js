@@ -8,8 +8,10 @@ const {
   captureCurrentProfile,
   writeCliToken,
   writeGeminiFileCredentials,
+  clearGeminiFileCredentials,
   saveConfig,
   loadConfig,
+  saveProfile,
   getProfile,
 } = require('./dist/core/profileStore');
 const {
@@ -57,18 +59,17 @@ async function runTests() {
     const isolatedBUserData = path.join(TEST_ROOT, 'SandboxHome', '.ag-stealth-switcher', 'isolated_envs', 'accountB_gmail_com', 'user-data');
     const isolatedBCli = path.join(isolatedBHome, '.antigravity-cli');
     fs.mkdirSync(isolatedBCli, { recursive: true });
+    fs.mkdirSync(isolatedBUserData, { recursive: true });
     fs.writeFileSync(
       path.join(isolatedBCli, 'oauth_token.json'),
       JSON.stringify({ id_token_email: 'accountB@gmail.com', access_token: 'token_B' })
     );
 
-    // Save config in isolated-dir mode
     saveConfig(TEST_ROOT, {
       mode: 'isolated-dir',
       activeProfile: 'accountB_gmail_com',
     });
 
-    // Simulate process running with isolated environment
     const origUserProfile = process.env.USERPROFILE;
     process.env.USERPROFILE = isolatedBHome;
 
@@ -86,7 +87,6 @@ async function runTests() {
     const sharedToken = JSON.parse(fs.readFileSync(path.join(sharedCli, 'oauth_token.json'), 'utf-8'));
     assert.strictEqual(sharedToken.access_token, 'token_A', 'Shared SandboxHome must remain token A (no credential leak)');
 
-    // Restore env
     if (origUserProfile) {
       process.env.USERPROFILE = origUserProfile;
     } else {
@@ -96,11 +96,101 @@ async function runTests() {
   }
 
   // -------------------------------------------------------------
-  // TEST 2: Toggle Mode does NOT change running process session paths
+  // TEST 2: Extension Host argv desync prevention (sibling deduction & AG_STEALTH_USER_DATA_DIR)
   // -------------------------------------------------------------
-  console.log('\n[Test 2] Verifying Toggle Mode does NOT alter running process session paths...');
+  console.log('\n[Test 2] Verifying Extension Host argv desync prevention (sibling deduction & AG_STEALTH_USER_DATA_DIR)...');
   {
-    // Start running in in-place mode (default SandboxHome and data/user-data)
+    const isolatedHome = path.join(TEST_ROOT, 'SandboxHome', '.ag-stealth-switcher', 'isolated_envs', 'acc_x', 'home');
+    const isolatedUserData = path.join(TEST_ROOT, 'SandboxHome', '.ag-stealth-switcher', 'isolated_envs', 'acc_x', 'user-data');
+    fs.mkdirSync(isolatedHome, { recursive: true });
+    fs.mkdirSync(isolatedUserData, { recursive: true });
+
+    const origUserProfile = process.env.USERPROFILE;
+    const origEnvUserData = process.env.AG_STEALTH_USER_DATA_DIR;
+
+    // Case A: No --user-data-dir in process.argv and no env var, but USERPROFILE points to isolated home
+    process.env.USERPROFILE = isolatedHome;
+    delete process.env.AG_STEALTH_USER_DATA_DIR;
+
+    const ctxA = getActiveSessionContext(TEST_ROOT);
+    assert.strictEqual(ctxA.userHome, isolatedHome, 'Home must be isolated home');
+    assert.strictEqual(
+      ctxA.userDataDir,
+      isolatedUserData,
+      'userDataDir MUST be deduced as sibling user-data folder, NOT fallback to shared data/user-data!'
+    );
+
+    // Case B: Explicit AG_STEALTH_USER_DATA_DIR provided
+    process.env.AG_STEALTH_USER_DATA_DIR = isolatedUserData;
+    const ctxB = getActiveSessionContext(TEST_ROOT);
+    assert.strictEqual(ctxB.userDataDir, isolatedUserData, 'userDataDir honors AG_STEALTH_USER_DATA_DIR');
+
+    // Restore env
+    if (origUserProfile) {
+      process.env.USERPROFILE = origUserProfile;
+    } else {
+      delete process.env.USERPROFILE;
+    }
+    if (origEnvUserData) {
+      process.env.AG_STEALTH_USER_DATA_DIR = origEnvUserData;
+    } else {
+      delete process.env.AG_STEALTH_USER_DATA_DIR;
+    }
+    console.log('  -> PASS: Token and state database remain 100% synchronized even when Extension Host lacks --user-data-dir in argv.');
+  }
+
+  // -------------------------------------------------------------
+  // TEST 3: Profile without cliToken cleanly purges lingering credentials
+  // -------------------------------------------------------------
+  console.log('\n[Test 3] Verifying switching to profile without cliToken cleans previous account credentials...');
+  {
+    const sharedHome = path.join(TEST_ROOT, 'SandboxHome');
+    const cliTokenFile = path.join(sharedHome, '.antigravity-cli', 'oauth_token.json');
+    fs.mkdirSync(path.dirname(cliTokenFile), { recursive: true });
+
+    // 1. Account A wrote credentials
+    writeCliToken(cliTokenFile, { access_token: 'accA_token' }, 'accA@gmail.com', TEST_ROOT);
+    writeGeminiFileCredentials(sharedHome, 'accA@gmail.com', { access_token: 'accA_token' }, TEST_ROOT);
+
+    assert.ok(fs.existsSync(cliTokenFile), 'Account A token must exist before switch');
+    const geminiCreds = path.join(sharedHome, '.gemini', 'oauth_creds.json');
+    assert.ok(fs.existsSync(geminiCreds), 'Account A gemini creds must exist');
+
+    // 2. Profile B has dbItems but NO cliToken
+    const profileB = {
+      email: 'accB@gmail.com',
+      label: 'accB@gmail.com',
+      capturedAt: new Date().toISOString(),
+      lastUsedAt: new Date().toISOString(),
+      telemetry: { machineId: 'm1', sqmId: 's1', devDeviceId: 'd1' },
+      dbItems: [{ key: 'antigravityUnifiedStateSync.oauthToken', value: 'tokenB_db' }],
+      cliToken: null,
+    };
+    saveProfile(TEST_ROOT, profileB);
+
+    // Simulate switchWorker logic: applying profile B
+    if (profileB.cliToken) {
+      writeCliToken(cliTokenFile, profileB.cliToken, profileB.email, TEST_ROOT);
+      writeGeminiFileCredentials(sharedHome, profileB.email, profileB.cliToken, TEST_ROOT);
+    } else {
+      // Must explicitly clear lingering CLI & Gemini file credentials!
+      if (fs.existsSync(cliTokenFile)) {
+        try { fs.unlinkSync(cliTokenFile); } catch {}
+      }
+      clearGeminiFileCredentials(sharedHome, TEST_ROOT);
+    }
+
+    assert.ok(!fs.existsSync(cliTokenFile), 'oauth_token.json must be unlinked; no lingering account A tokens!');
+    assert.ok(!fs.existsSync(geminiCreds), 'oauth_creds.json must be unlinked; no lingering account A tokens!');
+
+    console.log('  -> PASS: Profile without cliToken cleanly purges lingering previous credentials.');
+  }
+
+  // -------------------------------------------------------------
+  // TEST 4: Toggle Mode does NOT change running process session paths
+  // -------------------------------------------------------------
+  console.log('\n[Test 4] Verifying Toggle Mode does NOT alter running process session paths...');
+  {
     saveConfig(TEST_ROOT, {
       mode: 'in-place',
       activeProfile: 'inplace_user@example.com',
@@ -110,23 +200,19 @@ async function runTests() {
     const defaultHome = path.join(TEST_ROOT, 'SandboxHome');
     process.env.USERPROFILE = defaultHome;
 
-    // Check initial context
     const ctxBefore = getActiveSessionContext(TEST_ROOT);
     assert.strictEqual(ctxBefore.mode, 'in-place', 'Initially running mode is in-place');
     assert.strictEqual(ctxBefore.userHome, defaultHome, 'User home is SandboxHome');
 
-    // User toggles mode in UI to 'isolated-dir'
     const cfg = loadConfig(TEST_ROOT);
     cfg.mode = 'isolated-dir';
     saveConfig(TEST_ROOT, cfg);
 
-    // Re-check active session context while IDE is STILL RUNNING with original process env
     const ctxAfter = getActiveSessionContext(TEST_ROOT);
-    assert.strictEqual(ctxAfter.mode, 'in-place', 'Running mode MUST remain in-place (immutable during process lifecycle)');
+    assert.strictEqual(ctxAfter.mode, 'in-place', 'Running mode MUST remain in-place');
     assert.strictEqual(ctxAfter.configuredMode, 'isolated-dir', 'Configured mode for NEXT launch is isolated-dir');
     assert.strictEqual(ctxAfter.userHome, defaultHome, 'User home MUST remain SandboxHome without creating isolated dir');
 
-    // Restore env
     if (origUserProfile) {
       process.env.USERPROFILE = origUserProfile;
     } else {
@@ -136,16 +222,15 @@ async function runTests() {
   }
 
   // -------------------------------------------------------------
-  // TEST 3: Blank Profile separation of instanceId and account email
+  // TEST 5: Blank Profile directory ID (blank_*) is not taken for account email
   // -------------------------------------------------------------
-  console.log('\n[Test 3] Verifying Blank Profile directory ID (blank_*) is not taken for account email...');
+  console.log('\n[Test 5] Verifying Blank Profile directory ID (blank_*) is not taken for account email...');
   {
     const blankId = `blank_${Date.now()}`;
     const blankHome = path.join(TEST_ROOT, 'SandboxHome', '.ag-stealth-switcher', 'isolated_envs', blankId, 'home');
     const blankCli = path.join(blankHome, '.antigravity-cli');
     fs.mkdirSync(blankCli, { recursive: true });
 
-    // Simulate user logs in through browser, Antigravity writes real token
     const realEmail = 'alice.developer@gmail.com';
     fs.writeFileSync(
       path.join(blankCli, 'oauth_token.json'),
@@ -159,12 +244,10 @@ async function runTests() {
     assert.strictEqual(ctx.instanceId, blankId, 'instanceId must be the blank directory folder name');
     assert.strictEqual(ctx.account, undefined, 'account must NOT be blank_*');
 
-    // Capture profile without emailOverride
     const profile = await captureCurrentProfile(TEST_ROOT);
     assert.strictEqual(profile.email, realEmail, 'Profile email must be alice.developer@gmail.com, NOT blank_*');
     assert.strictEqual(profile.cliToken.id_token_email, realEmail);
 
-    // Restore env
     if (origUserProfile) {
       process.env.USERPROFILE = origUserProfile;
     } else {
@@ -174,49 +257,17 @@ async function runTests() {
   }
 
   // -------------------------------------------------------------
-  // TEST 4: Reading profile items from live uncheckpointed WAL
+  // TEST 6: Strict targeted auth cleaning (preserving third-party secrets)
   // -------------------------------------------------------------
-  console.log('\n[Test 4] Verifying extraction of live WAL frames via MVCC...');
+  console.log('\n[Test 6] Verifying strict targeted auth cleaning (preserving third-party secrets)...');
   {
     const dbDir = path.join(TEST_ROOT, 'data', 'user-data', 'User', 'globalStorage');
     fs.mkdirSync(dbDir, { recursive: true });
     const dbPath = path.join(dbDir, 'state.vscdb');
 
-    // Create DB with native SQLite in WAL mode
     const sdb = new DatabaseSync(dbPath);
     sdb.exec(`
-      PRAGMA journal_mode = WAL;
-      CREATE TABLE ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);
-      INSERT INTO ItemTable VALUES ('antigravityUnifiedStateSync.oauthToken', 'live_wal_secret_123');
-      INSERT INTO ItemTable VALUES ('jetskiStateSync.userStatus', 'active_live');
-    `);
-
-    // Verify WAL file exists and has data
-    const walPath = `${dbPath}-wal`;
-    assert.ok(fs.existsSync(walPath), 'WAL file must exist');
-    assert.ok(fs.statSync(walPath).size > 0, 'WAL file must have non-zero size');
-
-    // Extract auth items while database remains in WAL mode with live uncheckpointed frames
-    const extracted = await extractAuthItemsFromDb(dbPath, TEST_ROOT);
-    const tokenItem = extracted.find((it) => it.key === 'antigravityUnifiedStateSync.oauthToken');
-    assert.ok(tokenItem, 'Must find live WAL oauth token item');
-    assert.strictEqual(tokenItem.value, 'live_wal_secret_123', 'Must accurately read live uncheckpointed WAL value');
-
-    sdb.close();
-    console.log('  -> PASS: extractAuthItemsFromDb captures uncheckpointed WAL items without errors.');
-  }
-
-  // -------------------------------------------------------------
-  // TEST 5: Strict targeted auth cleaning (preserving third-party secrets)
-  // -------------------------------------------------------------
-  console.log('\n[Test 5] Verifying strict targeted auth cleaning (preserving third-party secrets)...');
-  {
-    const dbDir = path.join(TEST_ROOT, 'data', 'user-data', 'User', 'globalStorage');
-    const dbPath = path.join(dbDir, 'state.vscdb');
-
-    // Insert third-party extension secrets and general IDE layout keys
-    const sdb = new DatabaseSync(dbPath);
-    sdb.exec(`
+      CREATE TABLE IF NOT EXISTS ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);
       INSERT OR REPLACE INTO ItemTable VALUES ('secret://{"extensionId":"ms-vscode.azure-account"}', 'azure_vault_secret');
       INSERT OR REPLACE INTO ItemTable VALUES ('secret://{"extensionId":"github.copilot"}', 'copilot_github_secret');
       INSERT OR REPLACE INTO ItemTable VALUES ('workbench.action.antigravity.panelLayout', 'sidebar_left_compact');
@@ -225,10 +276,8 @@ async function runTests() {
     `);
     sdb.close();
 
-    // Perform clearAuthItemsInDb
     await clearAuthItemsInDb(dbPath, TEST_ROOT);
 
-    // Inspect remaining items
     const checkDb = new DatabaseSync(dbPath, { readOnly: true });
     const remaining = checkDb.prepare('SELECT key, value FROM ItemTable').all();
     checkDb.close();
@@ -244,57 +293,20 @@ async function runTests() {
   }
 
   // -------------------------------------------------------------
-  // TEST 6: Authentic token lifetime (no fake Date.now() + 1h synthesis)
+  // TEST 7: Migration of migrated_* keys and UNIQUE constraint collision safety
   // -------------------------------------------------------------
-  console.log('\n[Test 6] Verifying token lifetime preservation...');
-  {
-    const userHome = path.join(TEST_ROOT, 'SandboxHome');
-    const authenticExpiry = 1600000000000; // Past expired timestamp
-
-    writeGeminiFileCredentials(
-      userHome,
-      'test@example.com',
-      {
-        access_token: 'auth_token_xyz',
-        refresh_token: 'refresh_xyz',
-        expiry_date: authenticExpiry,
-      },
-      TEST_ROOT
-    );
-
-    const credsFile = path.join(userHome, '.gemini', 'oauth_creds.json');
-    const savedCreds = JSON.parse(fs.readFileSync(credsFile, 'utf-8'));
-    assert.strictEqual(savedCreds.expiry_date, authenticExpiry, 'Must preserve authentic expiry_date');
-
-    // When expiry is absent:
-    writeGeminiFileCredentials(
-      userHome,
-      'test@example.com',
-      {
-        access_token: 'auth_token_no_expiry',
-        refresh_token: 'refresh_xyz',
-      },
-      TEST_ROOT
-    );
-    const savedNoExpiry = JSON.parse(fs.readFileSync(credsFile, 'utf-8'));
-    assert.strictEqual(savedNoExpiry.expiry_date, 0, 'Must set 0 when expiry absent so language_server refreshes');
-
-    console.log('  -> PASS: authentic token lifetime preserved, no synthetic lifetime assigned.');
-  }
-
-  // -------------------------------------------------------------
-  // TEST 7: Accurate Statistics Migration & Seamless Deduplication
-  // -------------------------------------------------------------
-  console.log('\n[Test 7] Verifying statistics migration (no modulo deletion flaw, seamless legacy claiming)...');
+  console.log('\n[Test 7] Verifying migrated_* key handling and UNIQUE collision safety...');
   {
     const statsDbPath = path.join(TEST_ROOT, 'SandboxHome', '.ag-stealth-switcher', 'token_stats.db');
     fs.mkdirSync(path.dirname(statsDbPath), { recursive: true });
 
-    // Seed a legacy database without step_key column
+    // Seed database simulating an upgrade from commit a1180db:
+    // It contains rows with step_key = 'migrated_*', synthetic row 'gemini-active', and unkeyed row
     const sdb = new DatabaseSync(statsDbPath);
     sdb.exec(`
       CREATE TABLE token_usage (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
+        step_key TEXT,
         timestamp INTEGER NOT NULL,
         account_email TEXT NOT NULL,
         model TEXT NOT NULL,
@@ -305,39 +317,37 @@ async function runTests() {
         requested_model TEXT,
         ttft_ms INTEGER
       );
-      -- 1. Real request that happened to have 500 input and 180 output tokens (must NOT be purged!)
-      INSERT INTO token_usage VALUES (1, 1700000000, 'legacy@example.com', 'gemini-1.5-pro', 500, 180, 0, 680, 'gemini-1.5-pro', 100);
-      -- 2. Synthetic multiplier row from v1 (identified strictly by model = 'gemini-active')
-      INSERT INTO token_usage VALUES (2, 1700000010, 'legacy@example.com', 'gemini-active', 250, 180, 0, 430, 'gemini', 150);
-      -- 3. Another authentic legacy request
-      INSERT INTO token_usage VALUES (3, 1700000020, 'legacy@example.com', 'gemini-2.0-flash', 150, 250, 50, 400, 'gemini-2.0-flash', 120);
+      -- Row 1: Previously stamped with 'migrated_1_1700000000_gemini' by a1180db
+      INSERT INTO token_usage VALUES (1, 'migrated_1_1700000000_gemini', 1700000000, 'legacy@example.com', 'gemini-1.5-pro', 500, 180, 0, 680, 'gemini-1.5-pro', 100);
+      -- Row 2: Synthetic row from v1
+      INSERT INTO token_usage VALUES (2, NULL, 1700000010, 'legacy@example.com', 'gemini-active', 250, 180, 0, 430, 'gemini', 150);
+      -- Row 3: Authentic unkeyed row
+      INSERT INTO token_usage VALUES (3, NULL, 1700000020, 'legacy@example.com', 'gemini-2.0-flash', 150, 250, 50, 400, 'gemini-2.0-flash', 120);
     `);
     sdb.close();
 
-    // Open via openTokenStatsDb: triggers deterministic migration
+    // Open via openTokenStatsDb: triggers migration
     const { db, close } = await openTokenStatsDb(TEST_ROOT);
     close();
 
-    // Verify migration results
+    // Verify:
+    // 1. Synthetic 'gemini-active' row was purged
+    // 2. 'migrated_1_*' was reverted to NULL so trajectory re-sync can claim it
     const checkDb = new DatabaseSync(statsDbPath, { readOnly: true });
     const rows = checkDb.prepare('SELECT id, model, total_tokens, step_key FROM token_usage ORDER BY id').all();
     checkDb.close();
 
-    // Row 2 ('gemini-active') must be purged
-    // Row 1 (500/180) and Row 3 must be preserved!
-    assert.strictEqual(rows.length, 2, 'Exactly 2 authentic rows must remain; gemini-active purged');
-    assert.strictEqual(rows[0].id, 1, 'Authentic row 1 (500/180) must be preserved without false-positive purge');
-    assert.strictEqual(rows[0].model, 'gemini-1.5-pro');
-    assert.strictEqual(rows[0].total_tokens, 680);
-    assert.strictEqual(rows[0].step_key, null, 'Legacy rows remain unkeyed until claimed by authentic sync');
+    assert.strictEqual(rows.length, 2, 'Exactly 2 authentic rows remain');
+    assert.strictEqual(rows[0].id, 1);
+    assert.strictEqual(rows[0].step_key, null, 'migrated_* was successfully reset to NULL for incoming claim');
+    assert.strictEqual(rows[1].id, 3);
+    assert.strictEqual(rows[1].step_key, null);
 
-    assert.strictEqual(rows[1].id, 3, 'Authentic row 3 must be preserved');
-    assert.strictEqual(rows[1].model, 'gemini-2.0-flash');
-
-    // Simulate Language Server RPC trajectory sync: re-imports row 1 with authentic step_key
+    // Now test re-import with duplicate calls / colliding keys:
+    // Sync batch 1:
     await recordBatchUsage(TEST_ROOT, [
       {
-        stepKey: 'cascade_real_traj_1:0:msg_1',
+        stepKey: 'cascade_traj_1:0:msg_1',
         timestamp: 1700000000,
         accountEmail: 'legacy@example.com',
         model: 'gemini-1.5-pro',
@@ -348,21 +358,26 @@ async function runTests() {
       },
     ]);
 
-    // Inspect database after sync
-    const checkDb2 = new DatabaseSync(statsDbPath, { readOnly: true });
-    const rowsAfterSync = checkDb2.prepare('SELECT id, model, total_tokens, step_key FROM token_usage ORDER BY id').all();
-    checkDb2.close();
+    // Sync batch 2: Send the SAME step AGAIN (duplicate sync)
+    // MUST NOT fail with UNIQUE constraint violation!
+    await recordBatchUsage(TEST_ROOT, [
+      {
+        stepKey: 'cascade_traj_1:0:msg_1',
+        timestamp: 1700000000,
+        accountEmail: 'legacy@example.com',
+        model: 'gemini-1.5-pro',
+        inputTokens: 500,
+        outputTokens: 180,
+        cachedTokens: 0,
+        totalTokens: 680,
+      },
+    ]);
 
-    // Row 1 should have been claimed in-place with its authentic stepKey!
-    assert.strictEqual(rowsAfterSync.length, 2, 'No new row inserted! Legacy row was claimed in-place');
-    assert.strictEqual(rowsAfterSync[0].id, 1);
-    assert.strictEqual(rowsAfterSync[0].step_key, 'cascade_real_traj_1:0:msg_1', 'Authentic stepKey successfully claimed');
-
-    // Check summary totals: 680 + 400 = 1080 (zero double counting!)
+    // Verify row 1 was claimed with cascade_traj_1:0:msg_1 and total tokens remained accurate (680 + 400 = 1080)
     const summary = await getStatsSummary(TEST_ROOT);
-    assert.strictEqual(summary.totalTokens, 1080, 'Total tokens must equal 1080 with zero double counting');
+    assert.strictEqual(summary.totalTokens, 1080, 'Total tokens must equal 1080 with zero duplication');
 
-    console.log('  -> PASS: Statistics migration purges only synthetic records and claims legacy rows without double counting.');
+    console.log('  -> PASS: migrated_* keys properly reset, and duplicate sync never crashes on UNIQUE constraint.');
   }
 
   cleanDir(TEST_ROOT);

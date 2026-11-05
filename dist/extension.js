@@ -319,6 +319,11 @@ async function handleSwitchToBlank(context, sandboxRoot) {
  * Switches to a saved profile.
  */
 async function handleProfileSwitch(context, sandboxRoot, targetEmail) {
+    const profile = (0, profileStore_1.getProfile)(sandboxRoot, targetEmail);
+    if (!profile || (!profile.cliToken && (!profile.dbItems || profile.dbItems.length === 0))) {
+        vscode.window.showErrorMessage(`Cannot switch to profile "${targetEmail}": Profile contains no valid credentials or database items.`);
+        return;
+    }
     const config = (0, profileStore_1.loadConfig)(sandboxRoot);
     if (config.activeProfile === targetEmail) {
         vscode.window.showInformationMessage(`Account ${targetEmail} is already active.`);

@@ -408,8 +408,12 @@ function getActiveSessionContext(sandboxRoot, emailHint) {
     const config = loadConfig(sandboxRoot);
     let activeUserData = defaultPaths.userDataDir;
     let activeHome = defaultPaths.sandboxHome;
-    // 1. Scan command-line arguments for explicit --user-data-dir of CURRENT process
-    if (Array.isArray(process.argv)) {
+    // 1. Resolve activeUserData: check explicit environment variable first, then process.argv
+    const envUserData = process.env.AG_STEALTH_USER_DATA_DIR;
+    if (envUserData && envUserData.trim().length > 0) {
+        activeUserData = path.resolve(envUserData.trim());
+    }
+    else if (Array.isArray(process.argv)) {
         for (let i = 0; i < process.argv.length; i++) {
             const arg = process.argv[i];
             if (arg === '--user-data-dir' && i + 1 < process.argv.length) {
@@ -420,12 +424,26 @@ function getActiveSessionContext(sandboxRoot, emailHint) {
             }
         }
     }
-    // 2. Check process.env.USERPROFILE / HOME of CURRENT process
+    // 2. Resolve activeHome from process.env.USERPROFILE / HOME of CURRENT process
     const envHome = process.env.USERPROFILE || process.env.HOME;
     if (envHome &&
         path.resolve(envHome).toLowerCase().startsWith(path.resolve(sandboxRoot).toLowerCase()) &&
         path.resolve(envHome).toLowerCase() !== path.resolve(defaultPaths.sandboxHome).toLowerCase()) {
         activeHome = path.resolve(envHome);
+    }
+    // 3. Robust cross-deduction: if one path points to an isolated instance, deduce the sibling path
+    // to strictly prevent desynchronization (e.g. when VS Code Extension Host does not inherit --user-data-dir)
+    if (activeHome.includes('isolated_envs') && !activeUserData.includes('isolated_envs')) {
+        const deducedUserData = path.join(path.dirname(activeHome), 'user-data');
+        if (fs.existsSync(deducedUserData)) {
+            activeUserData = deducedUserData;
+        }
+    }
+    else if (activeUserData.includes('isolated_envs') && !activeHome.includes('isolated_envs')) {
+        const deducedHome = path.join(path.dirname(activeUserData), 'home');
+        if (fs.existsSync(deducedHome)) {
+            activeHome = deducedHome;
+        }
     }
     // 3. Determine if the CURRENT running process is running in an isolated directory
     const isIsolatedDir = activeUserData.includes('isolated_envs') ||

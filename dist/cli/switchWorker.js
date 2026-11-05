@@ -222,6 +222,10 @@ async function main() {
                 logWorker(sandboxRoot, `Error: Profile ${target} not found in store!`);
                 throw new Error(`Profile ${target} not found`);
             }
+            if (!profile.cliToken && (!profile.dbItems || profile.dbItems.length === 0)) {
+                logWorker(sandboxRoot, `Error: Profile ${target} has no credentials or database items. Aborting switch.`);
+                process.exit(1);
+            }
             logWorker(sandboxRoot, `Injecting credentials and telemetry for: ${profile.email}`);
             await (0, sqliteInjector_1.injectAuthItemsIntoDb)(paths.stateVscdb, profile.dbItems, sandboxRoot, profile.telemetry.devDeviceId);
             safeCheckpointAndConsolidateWal(paths.stateVscdb, sandboxRoot);
@@ -229,6 +233,16 @@ async function main() {
             if (profile.cliToken) {
                 (0, profileStore_1.writeCliToken)(paths.cliTokenFile, profile.cliToken, profile.email, sandboxRoot);
                 (0, profileStore_1.writeGeminiFileCredentials)(paths.sandboxHome, profile.email, profile.cliToken, sandboxRoot);
+            }
+            else {
+                // Explicitly clear lingering CLI & Gemini file credentials from previous account
+                if (fs.existsSync(paths.cliTokenFile)) {
+                    try {
+                        fs.unlinkSync(paths.cliTokenFile);
+                    }
+                    catch { }
+                }
+                (0, profileStore_1.clearGeminiFileCredentials)(paths.sandboxHome, sandboxRoot);
             }
             const config = (0, profileStore_1.loadConfig)(sandboxRoot);
             config.mode = 'in-place';
@@ -266,16 +280,32 @@ async function main() {
         }
         else {
             const profile = (0, profileStore_1.getProfile)(sandboxRoot, target);
-            if (profile) {
-                logWorker(sandboxRoot, `Populating isolated directory for: ${profile.email}`);
-                await (0, sqliteInjector_1.injectAuthItemsIntoDb)(isolatedVscdb, profile.dbItems, sandboxRoot, profile.telemetry.devDeviceId);
-                safeCheckpointAndConsolidateWal(isolatedVscdb, sandboxRoot);
-                (0, profileStore_1.writeTelemetry)(isolatedStorageJson, profile.telemetry, sandboxRoot);
-                const isolatedCliToken = path.join(userHome, '.antigravity-cli', 'oauth_token.json');
-                if (profile.cliToken) {
-                    (0, profileStore_1.writeCliToken)(isolatedCliToken, profile.cliToken, profile.email, sandboxRoot);
-                    (0, profileStore_1.writeGeminiFileCredentials)(userHome, profile.email, profile.cliToken, sandboxRoot);
+            if (!profile) {
+                logWorker(sandboxRoot, `Error: Profile ${target} not found in store!`);
+                process.exit(1);
+            }
+            if (!profile.cliToken && (!profile.dbItems || profile.dbItems.length === 0)) {
+                logWorker(sandboxRoot, `Error: Profile ${target} has no credentials or database items. Aborting switch.`);
+                process.exit(1);
+            }
+            logWorker(sandboxRoot, `Populating isolated directory for: ${profile.email}`);
+            await (0, sqliteInjector_1.injectAuthItemsIntoDb)(isolatedVscdb, profile.dbItems, sandboxRoot, profile.telemetry.devDeviceId);
+            safeCheckpointAndConsolidateWal(isolatedVscdb, sandboxRoot);
+            (0, profileStore_1.writeTelemetry)(isolatedStorageJson, profile.telemetry, sandboxRoot);
+            const isolatedCliToken = path.join(userHome, '.antigravity-cli', 'oauth_token.json');
+            if (profile.cliToken) {
+                (0, profileStore_1.writeCliToken)(isolatedCliToken, profile.cliToken, profile.email, sandboxRoot);
+                (0, profileStore_1.writeGeminiFileCredentials)(userHome, profile.email, profile.cliToken, sandboxRoot);
+            }
+            else {
+                // Explicitly clear lingering CLI & Gemini file credentials from previous account
+                if (fs.existsSync(isolatedCliToken)) {
+                    try {
+                        fs.unlinkSync(isolatedCliToken);
+                    }
+                    catch { }
                 }
+                (0, profileStore_1.clearGeminiFileCredentials)(userHome, sandboxRoot);
             }
             const config = (0, profileStore_1.loadConfig)(sandboxRoot);
             config.mode = 'isolated-dir';
@@ -294,7 +324,8 @@ async function main() {
     if (effectiveProxyUrl) {
         logWorker(sandboxRoot, `Setting isolated outbound proxy: ${effectiveProxyUrl} with NO_PROXY`);
     }
-    const spawnEnv = (0, sandboxEnv_1.getIsolatedEnv)(sandboxRoot, launchHomeDir, effectiveProxyUrl);
+    const spawnEnv = (0, sandboxEnv_1.getIsolatedEnv)(sandboxRoot, launchHomeDir, effectiveProxyUrl, launchUserDataDir);
+    spawnEnv.AG_STEALTH_USER_DATA_DIR = launchUserDataDir;
     // Crucial Electron fix: Strip ELECTRON_RUN_AS_NODE so the launched IDE starts as a full GUI application
     delete spawnEnv.ELECTRON_RUN_AS_NODE;
     delete spawnEnv['ELECTRON_RUN_AS_NODE'];

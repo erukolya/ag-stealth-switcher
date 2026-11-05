@@ -377,6 +377,14 @@ async function handleProfileSwitch(
   sandboxRoot: string,
   targetEmail: string
 ): Promise<void> {
+  const profile = getProfile(sandboxRoot, targetEmail);
+  if (!profile || (!profile.cliToken && (!profile.dbItems || profile.dbItems.length === 0))) {
+    vscode.window.showErrorMessage(
+      `Cannot switch to profile "${targetEmail}": Profile contains no valid credentials or database items.`
+    );
+    return;
+  }
+
   const config = loadConfig(sandboxRoot);
   if (config.activeProfile === targetEmail) {
     vscode.window.showInformationMessage(`Account ${targetEmail} is already active.`);
